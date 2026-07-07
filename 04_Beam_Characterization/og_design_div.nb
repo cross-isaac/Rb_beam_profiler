@@ -1,0 +1,83 @@
+(* Content-type: application/vnd.wolfram.mathematica *)
+
+(*** Wolfram Notebook File ***)
+(* http://www.wolfram.com/nb *)
+
+(* CreatedBy='Wolfram 14.3' *)
+
+(*CacheID: 234*)
+(* Internal cache information:
+NotebookFileLineBreakTest
+NotebookFileLineBreakTest
+NotebookDataPosition[       154,          7]
+NotebookDataLength[      2235,         73]
+NotebookOptionsPosition[      1708,         55]
+NotebookOutlinePosition[      2154,         72]
+CellTagsIndexPosition[      2111,         69]
+WindowFrame->Normal*)
+
+(* Beginning of Notebook Content *)
+Notebook[{
+
+Cell[CellGroupData[{
+Cell[BoxData[{
+ RowBox[{
+  RowBox[{"FWHM", " ", "=", " ", "5.8"}], ";"}], "\n", 
+ RowBox[{
+  RowBox[{"L", " ", "=", " ", 
+   RowBox[{"3", "*", "2.54", "*", "10"}]}], ";"}], "\n", 
+ RowBox[{
+  RowBox[{"a", " ", "=", " ", 
+   RowBox[{"32", "*", "0.1"}]}], ";"}], "\n", 
+ RowBox[{"Solve", "[", 
+  RowBox[{
+   RowBox[{"1.2", "==", 
+    RowBox[{
+     RowBox[{"ArcTan", "[", 
+      FractionBox[
+       RowBox[{
+        RowBox[{"(", 
+         RowBox[{"FWHM", "-", 
+          RowBox[{"a", "*", "x"}]}], ")"}], "/", "2"}], "L"], "]"}], "*", 
+     RowBox[{"180", "/", "Pi"}]}]}], ",", "x"}], "]"}]}], "Code",
+ CellChangeTimes->{{3.9858699723499737`*^9, 3.985870063538006*^9}, {
+  3.9858701069107056`*^9, 3.9858701196852627`*^9}},
+ CellLabel->"In[17]:=",ExpressionUUID->"b1bea07c-2e06-1647-8515-197fb9d95e33"],
+
+Cell[BoxData[
+ RowBox[{"{", 
+  RowBox[{"{", 
+   RowBox[{"x", "\[Rule]", "0.814898462552443`"}], "}"}], "}"}]], "Output",
+ CellChangeTimes->{{3.9858700373864803`*^9, 3.98587006431217*^9}, {
+  3.985870112726942*^9, 3.985870120171383*^9}},
+ CellLabel->"Out[20]=",ExpressionUUID->"e99b271b-5099-b543-b2af-5636ce9ee3d9"]
+}, Open  ]]
+},
+WindowSize->{573, 628.7142857142857},
+WindowMargins->{{325.2857142857143, Automatic}, {
+  21.857142857142776`, Automatic}},
+FrontEndVersion->"14.3 for Microsoft Windows (64-bit) (July 8, 2025)",
+StyleDefinitions->"Default.nb",
+ExpressionUUID->"2eb76726-bf17-7849-8f86-20ef7e2a581e"
+]
+(* End of Notebook Content *)
+
+(* Internal cache information *)
+(*CellTagsOutline
+CellTagsIndex->{}
+*)
+(*CellTagsIndex
+CellTagsIndex->{}
+*)
+(*NotebookFileOutline
+Notebook[{
+Cell[CellGroupData[{
+Cell[576, 22, 798, 22, 118, "Code",ExpressionUUID->"b1bea07c-2e06-1647-8515-197fb9d95e33"],
+Cell[1377, 46, 315, 6, 32, "Output",ExpressionUUID->"e99b271b-5099-b543-b2af-5636ce9ee3d9"]
+}, Open  ]]
+}
+]
+*)
+
+(* End of internal cache information *)
+

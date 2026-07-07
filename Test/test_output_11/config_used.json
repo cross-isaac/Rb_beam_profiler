@@ -1,0 +1,43 @@
+{
+  "time_column": "Time(s)",
+  "signal_column": "CH2(V)",
+  "sync_column": "CH4(V)",
+  "position_units_per_mm": 39.3701,
+  "segmentation": "sync",
+  "manual_boundaries_s": [],
+  "n_sides_expected": 4,
+  "edge_trim_fraction": 0.08,
+  "downsample_points_per_side": 3000,
+  "ramp_degree": 2,
+  "clip_sigma": 2.5,
+  "clip_iterations": 6,
+  "fit_peak_offset": true,
+  "gamma_rel_bounds": [
+    0.4,
+    2.5
+  ],
+  "center_tolerance_frac": 0.2,
+  "snr_min": 3.0,
+  "delta_aic_min": 6.0,
+  "min_good_sides": 2,
+  "rejected_mode": "keep",
+  "profile_models": [
+    "gaussian",
+    "lorentzian",
+    "pseudo_voigt"
+  ],
+  "profile_offset": false,
+  "error_mode": "STD",
+  "nozzle_diameter_in": 0.1,
+  "z_probe_in": 2.46,
+  "z_probe2_in": 12.3,
+  "z_substrate_in": 19.685,
+  "aperture_radius_cm": 0.5,
+  "oven_temp_C": 230.0,
+  "sigma_eff_cm2": 1.246e-09,
+  "f_F3": 0.5833333333333334,
+  "p_Rb85": 0.7217,
+  "flux_reference_position": 450.0,
+  "ar_flow_sccm": 0.01,
+  "ar_density_crystal_kg_m3": 1768.0
+}
