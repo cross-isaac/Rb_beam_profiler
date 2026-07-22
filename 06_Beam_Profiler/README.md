@@ -80,6 +80,15 @@ python run_gui.py
    adjust settings if needed, press **Run Full Pipeline**, watch the log.
 2. **Image Browser** — click through every stage image (segmentation, per-side
    background + peak fits with accept/reject verdicts, profile fits, summaries).
+   - **Position filter** narrows the per-side images to one probe position.
+   - **(profile picker)** is a live profile: click a point to jump straight to
+     the `02_side_fits` images behind it (red = noise-dominated; a purple ring
+     marks a position that already carries a hand-set verdict).
+   - **Side verdict bar** forces the selected side to ACCEPT or REJECT when the
+     automatic SNR/dAIC/runaway tests got it wrong. Verdicts are saved to
+     `manual_overrides.json` and take effect on the next run ("Re-run pipeline"
+     is right there); the automatic verdict is always shown alongside so an
+     override can never be mistaken for a fit that passed on its own.
 3. **Results** — the final numbers; button to open the output folder.
 
 Settings save/load as JSON so a whole analysis is reproducible.
@@ -124,17 +133,43 @@ profile is absolute and the flux comes directly from it — no calibration trace
 ```
 <output folder>/
 ├── config_used.json            exact settings of this run (reproducibility)
+├── manual_overrides.json       hand-set per-side verdicts, if any (see below)
 ├── 01_raw_traces/              full trace + detected side boundaries, per position
 ├── 02_side_fits/               per side: peak-aware background (top) and
 │                               Lorentzian fit with ACCEPT/REJECT verdict (bottom)
 ├── 03_profile/
-│   ├── absorption_profile.csv    per-position amplitude, error, flags, CH2 level
-│   ├── side_details.csv          per-side amplitude, centre, HWHM, SNR, verdicts
+│   ├── absorption_profile.csv    per-position amplitude, error, flags, CH2 level, sawtooth amp
+│   ├── side_details.csv          per-side amplitude, centre, HWHM, SNR, verdicts (auto + manual)
 │   ├── transmission_vs_position.png   CH2 DC level vs position
+│   ├── amplitude_vs_position.png      CH3 sawtooth (laser-sweep) amplitude vs position
 │   └── profile_<model>.png       spatial profile fit + parameter table
 ├── summary_<model>.png         final column-density profile + full results table
 └── results.json                all numbers, machine-readable
 ```
+
+**`amplitude_vs_position.png`** is the sawtooth-amplitude companion to the
+transmission diagnostic: top panel is the CH3 laser-power sweep's peak-to-peak
+span [V], measured over the fitted (edge-trimmed) side; bottom panel is that
+span ÷ the CH2 DC level, i.e. the fractional sweep depth reaching the detector,
+which should be **flat** across the scan if CH3 is simply the AC copy of CH2. A
+slope or step there flags a gain/range change the absolute-absorption scale
+should not be trusted through.
+
+## Manual side verdicts
+
+The automatic SNR / dAIC / linewidth-runaway tests are deliberately blunt so
+they can run unattended. When a verdict is obviously wrong on the
+`02_side_fits` image, override it from the Image Browser instead of loosening a
+threshold run-wide (which moves every other side too). Overrides live in
+`manual_overrides.json` in the output folder, keyed by the side label
+(`<file stem>:s<side>`, the same key as in `side_details.csv`), and are applied
+to the **final** fitting pass only — never to the pass that measures the
+reference linewidth, so a side kept by hand cannot redefine the matched-filter
+template. Every override is auditable: both verdicts land in `side_details.csv`
+(`accepted` vs `auto_accepted`), the side image says MANUAL OVERRIDE in a purple
+box, the profile/summary figures carry a footnote, and `results.json` records
+the full map. Set `use_manual_overrides: false` (or `--no-overrides`) to
+reproduce a purely automatic analysis without deleting the file.
 
 ## Package layout
 
@@ -144,6 +179,7 @@ beamprofiler/
 ├── trace_io.py          run-format CSV loading, whole-run triangle segmentation
 ├── ramp_removal.py      peak-aware corners background
 ├── peak_fitting.py      matched-filter localization, Lorentzian fit, validation
+├── side_overrides.py    hand-set per-side accept/reject verdicts (manual_overrides.json)
 ├── profile_analysis.py  profile models, Method A divergence, capture efficiency
 ├── flux.py              Beer-Lambert → column density → flux → dopant density
 ├── plotting.py          every figure the pipeline saves
@@ -160,6 +196,8 @@ beamprofiler/
 | `gamma_rel_bounds` | (0.4, 2.5) | refined-linewidth bounds, ×reference HWHM (allows edge broadening; rejects broad runaways) |
 | `snr_min` | 3.0 | reject a side fit below this amplitude/noise ratio |
 | `delta_aic_min` | 6.0 | peak model must beat background-only by this AIC margin |
+| `linewidth_runaway_fraction` | 0.97 | how close to the linewidth ceiling counts as "ran away" (1.0 = only exactly pinned; 0 = test off) |
+| `use_manual_overrides` | True | honour hand-set verdicts in `manual_overrides.json` |
 | `rejected_mode` | `zero` | failed side: `zero` (0, averaged in), `exclude`, or `keep` |
 | `min_good_sides` | 1 | fewer passing sides → position flagged (drawn red) |
 | `error_mode` | `STD` | per-position error: `STD` / `SEM` / `upper_bound` |
@@ -167,8 +205,14 @@ beamprofiler/
 | `z_probe_in` | 2.46 | nozzle→probe distance |
 | `ar_flow_sccm` | None | set to enable the dopant-density estimate |
 
-**If a good position gets rejected:** lower `snr_min` / `delta_aic_min`, and check
-the red-boxed verdict on its `02_side_fits` image for which test failed.
+**If a good position gets rejected:** check the red-boxed verdict on its
+`02_side_fits` image for which test failed. If it says *SNR* / *dAIC*, lower
+`snr_min` / `delta_aic_min`. If it says *linewidth ran away*, either raise
+`linewidth_runaway_fraction` toward 1.0 (only reject fits truly pinned at the
+bound) or raise the ceiling itself via `gamma_rel_bounds[1]` (GUI: "Max
+linewidth"). For a one-off — a single side the tests keep getting wrong — just
+force its verdict in the Image Browser rather than moving a threshold for the
+whole run.
 
 ---
 *Author: rebuilt with Claude Code for Isaac Cross, Odom Lab, Northwestern University.*

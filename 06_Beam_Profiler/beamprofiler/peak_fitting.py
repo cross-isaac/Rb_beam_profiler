@@ -26,8 +26,15 @@ Why this differs from a blind curve_fit — and from the v1 pipeline:
   being broad.
 
 Validation (per side): the fit is accepted only if
-    SNR  = A / background-noise RMS      >= snr_min, and
-    dAIC = AIC(background-only) - AIC(peak) >= delta_aic_min.
+    SNR  = A / background-noise RMS         >= snr_min,
+    dAIC = AIC(background-only) - AIC(peak) >= delta_aic_min, and
+    gamma / upper linewidth bound           <  linewidth_runaway_fraction
+(the last one catches a Lorentzian that ran away and ate the ramp curvature
+instead of fitting a line; set the fraction to 0 to switch that test off).
+
+A verdict can also be set by hand from the GUI's image browser — see
+side_overrides.py. Manual verdicts are recorded separately (`manual_override`,
+`auto_accepted`) so a figure or CSV always shows what the automatic tests said.
 """
 
 from __future__ import annotations
@@ -64,9 +71,20 @@ class PeakFit:
     chi2_reduced: float = np.nan
     snr: float = 0.0
     delta_aic: float = 0.0
-    accepted: bool = False
+    gamma_pinned_frac: float = 0.0  # fitted HWHM / upper linewidth bound (1.0 = pinned)
+    accepted: bool = False          # EFFECTIVE verdict (manual override wins)
+    auto_accepted: bool = False     # what the automatic tests alone concluded
+    manual_override: str | None = None   # "accept" / "reject" / None, set by side_overrides
     reject_reasons: list = field(default_factory=list)
     popt: np.ndarray | None = None
+
+    @property
+    def verdict_label(self) -> str:
+        """Human-readable verdict, naming a manual override when one is in force."""
+        if self.manual_override is None:
+            return "ACCEPTED" if self.accepted else "REJECTED"
+        was = "would auto-accept" if self.auto_accepted else "would auto-reject"
+        return ("ACCEPTED" if self.accepted else "REJECTED") + f" — MANUAL OVERRIDE ({was})"
 
     def curve(self, t: np.ndarray) -> np.ndarray:
         if self.popt is None:
@@ -220,10 +238,16 @@ def _refine_and_validate(
     # absorbing ramp-end curvature (inflating A and SNR), not a real line. This
     # is distinct from the modest broadening allowed within the bounds, which is
     # legitimate. (Pinning at the lower bound is fine — narrow is physical.)
-    if result.gamma >= 0.97 * g_hi:
-        reasons.append("linewidth ran away (pinned broad)")
+    # How close to the bound counts as "pinned" is the sensitivity knob
+    # `linewidth_runaway_fraction`; 0 disables the test entirely.
+    result.gamma_pinned_frac = result.gamma / g_hi if g_hi > 0 else 0.0
+    frac = config.linewidth_runaway_fraction
+    if frac > 0 and result.gamma_pinned_frac >= frac:
+        reasons.append(f"linewidth ran away ({result.gamma_pinned_frac:.2f} of the "
+                       f"{g_hi * 1e6:.0f} us bound, limit {frac:.2f})")
     result.reject_reasons = reasons
     result.accepted = not reasons
+    result.auto_accepted = result.accepted
     return result
 
 

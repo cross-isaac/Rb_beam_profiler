@@ -29,6 +29,16 @@ def main() -> int:
     ap.add_argument("--corner-fraction", type=float,
                     help="width of each corner anchor cluster (fraction of the side)")
     ap.add_argument("--snr-min", type=float, help="reject side fits below this SNR")
+    ap.add_argument("--runaway-fraction", type=float, metavar="F",
+                    help="'linewidth ran away' sensitivity: reject a side whose fitted "
+                         "HWHM reaches F x the upper linewidth bound (default 0.97; "
+                         "1.0 = only exactly-pinned fits; 0 = test off)")
+    ap.add_argument("--gamma-max", type=float, metavar="R",
+                    help="upper linewidth bound as a multiple of the reference HWHM "
+                         "(default 2.5) — sets where 'ran away' starts")
+    ap.add_argument("--no-overrides", action="store_true",
+                    help="ignore manual_overrides.json in the output folder "
+                         "(reproduce a purely automatic analysis)")
     ap.add_argument("--rejected-mode", choices=["zero", "exclude", "keep"],
                     help="how a failed side counts in the per-position average")
     ap.add_argument("--error-mode", choices=["STD", "SEM", "upper_bound"],
@@ -52,6 +62,12 @@ def main() -> int:
         config.corner_cluster_fraction = args.corner_fraction
     if args.snr_min is not None:
         config.snr_min = args.snr_min
+    if args.runaway_fraction is not None:
+        config.linewidth_runaway_fraction = args.runaway_fraction
+    if args.gamma_max is not None:
+        config.gamma_rel_bounds = (config.gamma_rel_bounds[0], args.gamma_max)
+    if args.no_overrides:
+        config.use_manual_overrides = False
     if args.rejected_mode is not None:
         config.rejected_mode = args.rejected_mode
     if args.error_mode is not None:

@@ -71,7 +71,8 @@ class AnalysisConfig:
     # Bounds for the refined linewidth, relative to the width scale (reference
     # HWHM, or the half-max estimate in the bootstrap pass). Wide enough for the
     # real broadening toward the beam edges, tight enough that a broad Lorentzian
-    # cannot run away and absorb the curved ramp ends.
+    # cannot run away and absorb the curved ramp ends. Raising the upper bound
+    # lets genuinely broad edge lines fit, but also gives a runaway more room.
     gamma_rel_bounds: tuple = (0.4, 2.5)
     center_refine_gammas: float = 4.0      # refined centre may move +/- this * gamma
     #                                        from the matched-filter location
@@ -82,8 +83,19 @@ class AnalysisConfig:
     # A fitted side is accepted only if BOTH hold:
     snr_min: float = 3.0            # fitted amplitude / background-noise RMS
     delta_aic_min: float = 6.0      # AIC improvement of the peak model over background-only
-    # (No "linewidth pinned" test — legitimate edge broadening must not be
-    # rejected as a bad fit.)
+    # ... and it is not a "linewidth ran away" fit. A Lorentzian driven into the
+    # UPPER linewidth bound is not a broad line, it is a broad *background*: the
+    # fit has swallowed the curved ramp end, which inflates both A and SNR. The
+    # test is how close to that bound counts as pinned, as a fraction of it:
+    #     1.0  — only fits sitting exactly on the bound are rejected (loosest)
+    #     0.97 — default; also catches fits crawling up against the bound
+    #     0.85 — aggressive; will start rejecting genuinely broad edge lines
+    #     0.0  — test OFF (nothing is ever rejected for its linewidth)
+    # Lower it if runaways are slipping through, raise it if real edge-broadened
+    # sides (which live near the bound) are being thrown away. Note the bound
+    # itself is gamma_rel_bounds[1] x the reference HWHM, so the two knobs work
+    # together: widening the bound also moves the runaway threshold outward.
+    linewidth_runaway_fraction: float = 0.97
 
     # ── combining sides into one profile point ────────────────────────────────
     # Each probe position has several sides. What to do with a side that FAILS
@@ -106,6 +118,15 @@ class AnalysisConfig:
     #   "upper_bound" — conservative noise-derived bound (snr_min * noise RMS),
     #                   ignoring scatter
     error_mode: str = "STD"
+
+    # ── manual per-side verdicts ─────────────────────────────────────────────
+    # The GUI's image browser can force a side to ACCEPT or REJECT, overriding
+    # the automatic tests above; the verdicts live in `manual_overrides.json` in
+    # the OUTPUT folder (see side_overrides.py). They are applied only to the
+    # final fitting pass, never to the reference-linewidth pass, so a hand-kept
+    # side cannot redefine the matched-filter template. Set False to reproduce a
+    # purely automatic analysis without deleting the file.
+    use_manual_overrides: bool = True
 
     # ── spatial profile fitting ──────────────────────────────────────────────
     profile_models: list = field(default_factory=lambda: ["gaussian", "lorentzian"])
