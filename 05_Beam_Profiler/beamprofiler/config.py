@@ -25,12 +25,27 @@ from pathlib import Path
 @dataclass
 class AnalysisConfig:
     # ── data layout ───────────────────────────────────────────────────────────
-    time_column: str = "Time(s)"          # scope time column
-    signal_column: str = "CH2(V)"         # photodetector signal column
+    # Two on-disk layouts are auto-detected per file:
+    #   * legacy — "Time(s),CH2(V),CH4(V)" exports named by stage position in
+    #     thou (450.csv); CH2 is the (amplified) signal, absorption is relative.
+    #   * run    — acquisition-runner folders (point_0001.csv ...) with a
+    #     "# target_in: ..." metadata header and columns time_s/CH2_V/CH3_V/CH4_V:
+    #     CH2 = raw DC photodetector level, CH3 = AC-coupled signal (fitted),
+    #     CH4 = sync. Positions come from the header (inches) and absorption is
+    #     ABSOLUTE: peak depth on CH3 normalized by the CH2 DC level per side.
+    time_column: str = "Time(s)"          # scope time column (legacy format)
+    signal_column: str = "CH2(V)"         # photodetector signal column (legacy format)
     sync_column: str = "CH4(V)"           # square-wave ramp sync from scan controller
     # Probe positions are encoded in the CSV filenames (e.g. "450.csv") in
-    # translation-stage units. 39.3701 thou = 1 mm.
+    # translation-stage units. 39.3701 thou = 1 mm. (Run-format positions are
+    # given in inches and converted to thou on load, so this stays valid.)
     position_units_per_mm: float = 39.3701
+    # Absorption scale: "auto" -> absolute when a DC channel is present (run
+    # format), relative otherwise; or force "absolute" / "relative".
+    absorption_mode: str = "auto"
+    # Photodiode dark level [V] subtracted from the CH2 DC reading before
+    # normalizing (raw diode straight into the scope: leave at 0).
+    dark_offset_V: float = 0.0
 
     # ── ramp segmentation ─────────────────────────────────────────────────────
     # "sync"   — split the trace at edges of the sync square wave (preferred;
@@ -43,13 +58,48 @@ class AnalysisConfig:
     n_sides_expected: int = 4       # warn if segmentation finds a different count
     edge_trim_fraction: float = 0.08  # fraction trimmed from each side end (ramp turnaround artifacts)
     downsample_points_per_side: int = 3000  # bin-average each side to this many points
+    # Optics imperfections curve the ends of each (nominally linear) ramp side
+    # beyond the fixed edge trim. With auto_trim on, each side's largest
+    # genuinely-linear central window is detected (see ramp_removal.find_linear_core)
+    # and both the background and peak fits are restricted to it.
+    auto_trim: bool = True
+    auto_trim_max_fraction: float = 0.30   # never auto-trim more than this per end
+    auto_trim_sigma: float = 2.5           # threshold in units of the measured
+    #                                        smoothed-residual noise (ripple-aware)
 
     # ── ramp / background removal ────────────────────────────────────────────
-    ramp_degree: int = 2            # polynomial degree (2 recommended: RC filter phase
-    #                                 shift adds curvature on top of the linear ramp; use 1
-    #                                 for unfiltered traces if preferred)
+    # Background polynomial degree: "auto" picks 1 for run-format (raw) data —
+    # the ramp is verified linear once the curved ends are auto-trimmed, and a
+    # quadratic would absorb part of the broad absorption dip — and 2 for
+    # legacy amplified data (RC-filter phase shift adds real curvature).
+    # Set 1 or 2 explicitly to override.
+    ramp_degree: int | str = "auto"
     clip_sigma: float = 2.5         # sigma-clipping threshold for masking the absorption dip
     clip_iterations: int = 6        # max sigma-clip iterations when isolating the background
+    # How the background is anchored on each side:
+    #   "corners" — measure the triangle-wave amplitude directly: average a
+    #               small cluster of points at each end of the side (near the
+    #               ramp turn points) and draw the straight line through the
+    #               two cluster means. No masking, no per-side decisions —
+    #               the most reproducible method on the 2026 run data
+    #               (side-to-side scatter 4.3% vs 5.8% for "wings"). Defines
+    #               a straight line, so it applies when the effective ramp
+    #               degree is 1 (run-format data); degree-2 legacy data falls
+    #               back to "masked" automatically.
+    #   "wings"   — fit the polynomial to all points at least
+    #               wing_inner_gammas × Γ away from the peak centre.
+    #   "masked"  — fit everything except an iteratively sigma-clipped feature
+    #               mask (the pre-2026 behaviour).
+    background_method: str = "corners"
+    corner_cluster_fraction: float = 0.05  # cluster size at each side end,
+    #                                        as a fraction of the side ("corners")
+    # Fraction of each side end excluded from the PEAK fit with "corners": the
+    # corner clusters still pin the background line, but the curved ends they
+    # sit on would otherwise let the Lorentzian linewidth run away on weak
+    # positions (fit window = central 1 - 2×this).
+    corner_fit_exclude_fraction: float = 0.15
+    wing_inner_gammas: float = 4.0  # wings start this many HWHM from the peak
+    #                                 centre (Lorentzian is down to ~6% there)
 
     # ── Lorentzian peak fitting & noise rejection ────────────────────────────
     fit_peak_offset: bool = True    # allow a constant offset in the peak fit

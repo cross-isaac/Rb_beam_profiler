@@ -1,14 +1,22 @@
 """
 Absolute flux and dopant-density calculations (thesis Sec. 4.6).
 
-The amplified divergence data only gives RELATIVE absorption. For absolute
-numbers a separate unattenuated trace (photodiode straight to the scope,
-bypassing the filter-amplifier) is recorded at one reference position. From it:
+Two routes to the same physics:
+
+* Absolute profiles (run-format data, op-amp bypassed): every position already
+  carries a true fractional absorption (CH3 dip / CH2 DC level), so the fitted
+  profile IS the absorption map — `flux_from_absolute_profile` converts it
+  point-wise via Beer-Lambert and integrates. No calibration trace needed.
+
+* Legacy relative profiles: the amplified divergence data only gives RELATIVE
+  absorption; a separate unattenuated trace at one reference position sets the
+  scale (`flux_from_profile`).
+
+Either way:
 
     fractional absorption A  ->  OD = -ln(1 - A)             (Beer-Lambert)
     column density N_col = OD / (sigma_eff * f_F3 * P_85)    [cm^-2, all Rb]
-    rescale the relative profile so its value at the reference position
-        equals N_col, integrate across the beam -> N_slice   [cm^-1]
+    integrate N_col across the beam -> N_slice               [cm^-1]
     flux  = N_slice * v_mean,  v_mean = sqrt(8 kB T / pi m)  [atoms/s]
 
 For dual-species operation the Rb:Ar flux ratio maps onto the dopant density
@@ -59,6 +67,63 @@ def column_density_from_absorption(absorption_frac: float, config: AnalysisConfi
     n_col_85_f3 = od / config.sigma_eff_cm2          # 85Rb, F=3 only
     n_col = n_col_85_f3 / config.f_F3 / config.p_Rb85
     return od, n_col
+
+
+def flux_from_absolute_profile(
+    profile: ProfileFit,
+    config: AnalysisConfig,
+) -> FluxResult:
+    """Absolute Rb flux straight from a profile fitted in percent absorption.
+
+    Run-format data measures a true absorption percentage at every position, so
+    the fitted profile A(y) [%] converts point-wise to a column density via
+    Beer-Lambert and integrates directly — no calibration trace, and any
+    per-point window-transmission difference has already been normalized out.
+    """
+    func = _MODELS[profile.model][0]
+    args = tuple(profile.popt[:4]) if profile.model == "pseudo_voigt" else tuple(profile.popt[:3])
+    thou_to_cm = IN_TO_CM / THOU_PER_IN
+    scale = 1.0 / (config.sigma_eff_cm2 * config.f_F3 * config.p_Rb85)
+
+    # Peak (profile centre) values for reporting.
+    A_peak = float(func(profile.center, *args)) / 100.0
+    od_peak = -math.log(max(1.0 - A_peak, 1e-12))
+    n_col_peak = od_peak * scale
+
+    def n_col_cm(y_cm):
+        A = func(y_cm / thou_to_cm, *args) / 100.0
+        A = np.clip(A, 0.0, 1.0 - 1e-12)
+        return -np.log1p(-A) * scale
+
+    n_slice, _ = quad(n_col_cm, -np.inf, np.inf)
+
+    T_K = 273.15 + config.oven_temp_C
+    v_mean = math.sqrt(8.0 * KB * T_K / (math.pi * M_RB)) * 100.0   # cm/s
+    rb_flux = n_slice * v_mean
+
+    width_cm = profile.fwhm_mm / 10.0
+    n_vol = n_col_peak / width_cm if width_cm > 0 else float("nan")
+
+    result = FluxResult(
+        absorption_frac=A_peak,
+        optical_depth=od_peak,
+        n_col_cm2=n_col_peak,
+        n_slice_cm1=n_slice,
+        v_mean_cm_s=v_mean,
+        rb_flux_atoms_s=rb_flux,
+        number_density_cm3=n_vol,
+        # summary plots multiply the % profile by this to draw column density
+        rescale_factor=n_col_peak / max(A_peak * 100.0, 1e-12),
+        reference_position=profile.center,
+    )
+
+    if config.ar_flow_sccm is not None:
+        ar_flux, dopant = dopant_density(config.ar_flow_sccm, rb_flux,
+                                         config.ar_density_crystal_kg_m3)
+        result.ar_flux_atoms_s = ar_flux
+        result.dopant_density_cm3 = dopant
+
+    return result
 
 
 def flux_from_profile(

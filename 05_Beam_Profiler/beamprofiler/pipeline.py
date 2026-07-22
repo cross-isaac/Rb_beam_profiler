@@ -21,30 +21,48 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
 
 from .config import AnalysisConfig
 from . import plotting
-from .flux import flux_from_profile
+from .flux import flux_from_absolute_profile, flux_from_profile
 from .peak_fitting import PeakFit, ReferencePeak, fit_side, make_reference
 from .profile_analysis import ProfileFit, divergence_method_b, fit_profile
-from .ramp_removal import subtract_ramp
-from .trace_io import Trace, load_trace, segment
+from .ramp_removal import (find_linear_core, subtract_ramp,
+                           subtract_ramp_corners, subtract_ramp_wings)
+from .trace_io import IN_TO_THOU, Trace, load_trace, read_run_metadata, segment
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 @dataclass
+class SideBundle:
+    """Everything produced for one ramp side of one trace."""
+    side: object                  # RampSide (full, segmentation-trimmed arrays)
+    ramp: object                  # RampFit over the linear core
+    peak: PeakFit
+    t_used: np.ndarray            # time actually fitted (linear core)
+    y_used: np.ndarray            # fitted signal (V, or % absorption)
+    sigma_used: float             # noise RMS in the same units as y_used
+    core: np.ndarray              # bool mask over side.t (True = kept)
+    label: str                    # "<file stem>:s<index>" for reporting
+    method: str = "masked"        # background method actually used on this side
+
+
+@dataclass
 class PositionResult:
-    """Combined result for one probe position (one CSV file)."""
-    position: float                      # stage units (from the filename)
-    side_fits: dict = field(default_factory=dict)   # side index -> PeakFit
+    """Combined result for one probe position (one or more CSV files)."""
+    position: float                      # stage units [thou]
+    side_fits: list = field(default_factory=list)   # list[(label, PeakFit)]
     amplitude: float = 0.0               # mean over accepted sides
     amplitude_err: float = 0.0           # STD or SEM over accepted sides
-    noise_floor: float = 0.0             # median background noise RMS
+    noise_floor: float = 0.0             # median background noise RMS (fit units)
     n_good_sides: int = 0
     accepted: bool = False
+    dc_mean: float | None = None         # mean CH2 transmission level [V] (run format)
+    n_files: int = 1
 
 
 def _log(progress, msg: str):
@@ -54,16 +72,27 @@ def _log(progress, msg: str):
         progress(msg.encode("ascii", errors="replace").decode("ascii"))
 
 
-def discover_position_files(folder: str | Path) -> dict[float, Path]:
-    """Map stage position -> CSV path for numerically-named files (e.g. 450.csv).
+def discover_position_files(folder: str | Path) -> dict[float, list[Path]]:
+    """Map stage position [thou] -> CSV paths.
 
-    Non-numeric names (full0.csv, RelativeAbsFar.csv, ...) are ignored — those
-    are calibration/derived files, not position scans.
+    Run-format folders (point_*.csv with a '# target_in' header) take priority:
+    the position comes from the metadata (inches -> thou) and several files may
+    share one position (multi-pass scans). Otherwise, legacy numerically-named
+    files (450.csv = position in thou) are used; non-numeric names (full0.csv,
+    RelativeAbsFar.csv, ...) are ignored — those are calibration/derived files.
     """
-    out = {}
-    for p in sorted(Path(folder).glob("*.csv")):
+    folder = Path(folder)
+    out: dict[float, list[Path]] = {}
+    run_files = [p for p in sorted(folder.glob("point_*.csv"))
+                 if "target_in" in read_run_metadata(str(p))]
+    if run_files:
+        for p in run_files:
+            pos = float(read_run_metadata(str(p))["target_in"]) * IN_TO_THOU
+            out.setdefault(pos, []).append(p)
+        return out
+    for p in sorted(folder.glob("*.csv")):
         if re.fullmatch(r"\d+(\.\d+)?", p.stem):
-            out[float(p.stem)] = p
+            out.setdefault(float(p.stem), []).append(p)
     return out
 
 
@@ -83,51 +112,151 @@ def _expected_feature_mask(side, reference: ReferencePeak, config: AnalysisConfi
     else:
         frac = float(np.mean(list(reference.center_frac.values())))
     center = side.t[0] + frac * duration
-    half_window = max(3.0 * reference.gamma,
-                      config.center_tolerance_frac * duration)
+    # Wide enough to cover the Lorentzian wings (4Γ ≈ 6% of peak) and modest
+    # centre wander, but no wider — an over-sized mask starves the background
+    # fit of anchor points.
+    half_window = max(4.0 * reference.gamma,
+                      0.5 * config.center_tolerance_frac * duration)
     return (side.t > center - half_window) & (side.t < center + half_window)
 
 
 def _fit_trace_sides(trace: Trace, config: AnalysisConfig,
                      reference: ReferencePeak | None,
-                     percent_mode: bool = False):
+                     percent_mode: bool = False,
+                     absolute_mode: bool = False) -> list[SideBundle]:
     """Background-subtract and Lorentzian-fit every side of a trace.
 
-    percent_mode: convert the subtracted signal to percent absorption
-    (100·ΔV/V_background) — used for the unattenuated flux traces where the
-    absolute scale matters.
-    Returns list of (side, ramp_fit, peak_fit, y_used, sigma_used).
+    With `config.auto_trim`, each side is first restricted to its detected
+    linear core (the curved ramp ends from the optics cannot be represented by
+    the background polynomial and would masquerade as signal).
+
+    percent_mode:  convert the subtracted signal to percent absorption
+                   normalized by the FITTED BACKGROUND (legacy unattenuated
+                   flux traces, where CH2 carries the full DC level).
+    absolute_mode: convert to percent absorption normalized by the CH2 DC
+                   level of the side (run format: CH3 dip / CH2 transmission),
+                   so every position yields a true absorption percentage.
     """
+    stem = Path(trace.path).stem
+    # "auto" degree: 1 for run-format (raw) traces — linear once the curved
+    # ends are trimmed; a quadratic would absorb part of the broad dip — and
+    # 2 for legacy amplified traces (real RC-filter curvature).
+    degree = config.ramp_degree
+    if not isinstance(degree, int):
+        degree = 1 if trace.dc is not None else 2
+    # "corners" defines a straight line through the two turn-point clusters, so
+    # it only applies when the effective background is linear; curved legacy
+    # backgrounds (degree 2) fall back to the sigma-clip method.
+    method = config.background_method
+    if method == "corners" and degree != 1:
+        method = "masked"
     out = []
     for side in trace.sides:
         pre_mask = (_expected_feature_mask(side, reference, config)
                     if reference is not None else None)
-        ramp = subtract_ramp(
-            side.t, side.v, degree=config.ramp_degree,
-            clip_sigma=config.clip_sigma, clip_iterations=config.clip_iterations,
-            known_feature_mask=pre_mask,
-        )
-        if percent_mode:
+
+        # Bootstrap peak estimate when no reference exists yet (reference-
+        # selection pass): both the core detection and the wings background
+        # need to know roughly where the peak is. ("corners" needs neither —
+        # its anchors are fixed at the side ends.)
+        pf0 = None
+        if reference is None and method != "corners" and (config.auto_trim or method == "wings"):
+            ramp0 = subtract_ramp(
+                side.t, side.v, degree=degree,
+                clip_sigma=config.clip_sigma, clip_iterations=config.clip_iterations)
+            pf0 = fit_side(side.t, ramp0.subtracted, ramp0.sigma_noise, config,
+                           reference=None, side_index=side.index)
+
+        n_pts = len(side.t)
+        core = np.ones(n_pts, dtype=bool)
+        if method == "corners":
+            # The background line is anchored on the corner clusters of the
+            # FULL side; the peak fit then runs on the interior only, so the
+            # curved ends under the anchors cannot inflate the linewidth.
+            a = int(config.corner_fit_exclude_fraction * n_pts)
+            if a > 0:
+                core[:a] = False
+                core[n_pts - a:] = False
+        elif config.auto_trim:
+            trim_mask = pre_mask
+            if trim_mask is None and pf0 is not None and pf0.popt is not None:
+                duration = float(side.t[-1] - side.t[0])
+                half_w = min(4.0 * max(pf0.gamma, 1e-9), 0.30 * duration)
+                trim_mask = (side.t > pf0.center - half_w) & (side.t < pf0.center + half_w)
+            core = find_linear_core(
+                side.t, side.v, degree=degree,
+                clip_sigma=config.clip_sigma, clip_iterations=config.clip_iterations,
+                known_feature_mask=trim_mask,
+                max_trim_fraction=config.auto_trim_max_fraction,
+                resid_sigma=config.auto_trim_sigma,
+            )
+        tc, vc = side.t[core], side.v[core]
+
+        # Where should the background expect the peak? (same convention as
+        # fit_side: reference centre fraction applies to the fitted window)
+        center_est = gamma_est = None
+        if reference is not None:
+            frac = reference.center_frac.get(
+                side.index, float(np.mean(list(reference.center_frac.values()))))
+            center_est = float(tc[0] + frac * (tc[-1] - tc[0]))
+            gamma_est = reference.gamma
+        elif pf0 is not None and pf0.popt is not None:
+            center_est, gamma_est = pf0.center, max(pf0.gamma, 1e-9)
+
+        if method == "corners":
+            # Anchor the line on the FULL side (the clusters sit at the ends);
+            # only the interior enters the peak fit.
+            ramp = subtract_ramp_corners(
+                side.t, side.v, cluster_fraction=config.corner_cluster_fraction)
+            sub_fit = ramp.subtracted[core]
+        elif method == "wings" and center_est is not None:
+            ramp = subtract_ramp_wings(
+                tc, vc, center=center_est,
+                inner_halfwidth=config.wing_inner_gammas * gamma_est,
+                degree=degree)
+            sub_fit = ramp.subtracted
+        else:
+            ramp = subtract_ramp(
+                tc, vc, degree=degree,
+                clip_sigma=config.clip_sigma, clip_iterations=config.clip_iterations,
+                known_feature_mask=(pre_mask[core] if pre_mask is not None else None),
+            )
+            sub_fit = ramp.subtracted
+        if absolute_mode and side.dc_mean is not None:
+            # True absorption percent: CH3 dip depth over CH2 DC transmission.
+            denom = side.dc_mean - config.dark_offset_V
+            y = 100.0 * sub_fit / denom
+            sigma = 100.0 * ramp.sigma_noise / denom
+        elif percent_mode:
             # Guard against non-physical backgrounds near zero volts.
             bg = np.where(np.abs(ramp.background) > 1e-6, ramp.background, np.nan)
             y = 100.0 * ramp.subtracted / bg
             y = np.nan_to_num(y, nan=0.0)
             sigma = 100.0 * ramp.sigma_noise / float(np.nanmedian(np.abs(bg)))
         else:
-            y, sigma = ramp.subtracted, ramp.sigma_noise
+            y, sigma = sub_fit, ramp.sigma_noise
 
-        pf = fit_side(side.t, y, sigma, config,
+        pf = fit_side(tc, y, sigma, config,
                       reference=reference, side_index=side.index)
-        out.append((side, ramp, pf, y, sigma))
+        if absolute_mode and side.dc_mean is not None and pf.popt is not None:
+            # Fold the DC-normalization uncertainty (scatter + ADC quantization
+            # of CH2) into the amplitude error.
+            rel_dc = (side.dc_err or 0.0) / max(side.dc_mean - config.dark_offset_V, 1e-9)
+            pf.amplitude_err = float(np.hypot(pf.amplitude_err, pf.amplitude * rel_dc))
+        out.append(SideBundle(side=side, ramp=ramp, peak=pf, t_used=tc,
+                              y_used=y, sigma_used=sigma, core=core,
+                              label=f"{stem}:s{side.index}", method=method))
     return out
 
 
 def run_extraction(data_folder: str, output_folder: str, config: AnalysisConfig,
-                   progress=None, label: str = "") -> tuple[pd.DataFrame, list]:
+                   progress=None, label: str = "") -> tuple[pd.DataFrame, list, bool]:
     """Stages 1-3 for every position CSV in `data_folder`.
 
-    Returns (profile DataFrame, list[PositionResult]) and writes
-    absorption_profile.csv plus all stage images under `output_folder`.
+    Returns (profile DataFrame, list[PositionResult], absolute_mode) and writes
+    absorption_profile.csv (+ side_details.csv) plus all stage images under
+    `output_folder`. In absolute mode the amplitudes are true percent
+    absorption (CH3 dip normalized by the CH2 DC level per side).
     """
     out = Path(output_folder)
     dir_raw = out / "01_raw_traces"
@@ -139,35 +268,55 @@ def run_extraction(data_folder: str, output_folder: str, config: AnalysisConfig,
     files = discover_position_files(data_folder)
     if not files:
         raise FileNotFoundError(
-            f"No position CSVs (numeric filenames like 450.csv) found in {data_folder}")
-    _log(progress, f"Found {len(files)} position files in {data_folder}")
+            f"No position CSVs (point_*.csv with a target_in header, or numeric "
+            f"filenames like 450.csv) found in {data_folder}")
+    n_files = sum(len(v) for v in files.values())
+    _log(progress, f"Found {n_files} files at {len(files)} positions in {data_folder}")
 
     # ── load & segment all traces (kept in memory: sides are downsampled) ────
-    traces: dict[float, Trace] = {}
-    for pos, path in files.items():
-        tr = segment(load_trace(str(path), config), config)
-        if len(tr.sides) != config.n_sides_expected:
-            _log(progress, f"  note: {path.name}: {len(tr.sides)} ramp sides "
-                           f"(expected {config.n_sides_expected})")
-        traces[pos] = tr
-        plotting.plot_trace_segmentation(
-            tr, str(dir_raw / f"{path.stem}_trace.png"),
-            title=f"{label} position {path.stem} — segmentation")
+    traces: dict[float, list[Trace]] = {}
+    for pos, paths in files.items():
+        traces[pos] = []
+        for path in paths:
+            tr = segment(load_trace(str(path), config), config)
+            if len(tr.sides) != config.n_sides_expected:
+                _log(progress, f"  note: {path.name}: {len(tr.sides)} ramp sides "
+                               f"(expected {config.n_sides_expected})")
+            traces[pos].append(tr)
+            plotting.plot_trace_segmentation(
+                tr, str(dir_raw / f"{path.stem}_trace.png"),
+                title=f"{label} position {pos:g} — {path.stem} — segmentation")
     _log(progress, "All traces loaded and segmented.")
 
-    # ── pick the reference position: strongest unconstrained peak SNR ────────
+    # ── absorption scale: absolute (CH3/CH2, run format) or relative ─────────
+    have_dc = all(tr.dc is not None for trs in traces.values() for tr in trs)
+    if config.absorption_mode == "absolute" and not have_dc:
+        raise ValueError("absorption_mode='absolute' requires the run data format "
+                         "with a CH2 DC column in every file.")
+    absolute_mode = (config.absorption_mode == "absolute"
+                     or (config.absorption_mode == "auto" and have_dc))
+    unit = "% absorption" if absolute_mode else "V (relative)"
+    _log(progress, f"Absorption scale: {'ABSOLUTE (CH3 dip / CH2 DC level)' if absolute_mode else 'relative'}"
+                   + (f", dark offset {config.dark_offset_V:g} V" if absolute_mode and config.dark_offset_V else ""))
+
+    # ── pick the reference trace: strongest unconstrained peak SNR ───────────
     _log(progress, "Selecting reference (strongest) position ...")
-    best_pos, best_snr, best_fits = None, -np.inf, None
-    for pos, tr in traces.items():
-        fits = _fit_trace_sides(tr, config, reference=None)
-        snrs = [pf.snr for (_, _, pf, _, _) in fits if pf.popt is not None]
-        score = float(np.median(snrs)) if snrs else -np.inf
-        if score > best_snr:
-            best_pos, best_snr, best_fits = pos, score, fits
+    best_pos, best_snr, best_bundles = None, -np.inf, None
+    for pos, trs in traces.items():
+        for tr in trs:
+            bundles = _fit_trace_sides(tr, config, reference=None,
+                                       absolute_mode=absolute_mode)
+            snrs = [b.peak.snr for b in bundles if b.peak.popt is not None]
+            score = float(np.median(snrs)) if snrs else -np.inf
+            if score > best_snr:
+                best_pos, best_snr, best_bundles = pos, score, bundles
     _log(progress, f"Reference position: {best_pos:g} (median SNR {best_snr:.1f})")
 
+    # The reference template's centre fractions must refer to the same time
+    # windows the fits actually used (the linear cores), so pass those.
     reference = make_reference(
-        {s.index: pf for (s, _, pf, _, _) in best_fits}, traces[best_pos].sides)
+        {b.side.index: b.peak for b in best_bundles},
+        [SimpleNamespace(index=b.side.index, t=b.t_used) for b in best_bundles])
     if reference is None:
         raise RuntimeError(
             "No valid absorption peak found at any position — check the data, "
@@ -177,25 +326,40 @@ def run_extraction(data_folder: str, output_folder: str, config: AnalysisConfig,
 
     # ── constrained fits for every position ──────────────────────────────────
     results: list[PositionResult] = []
+    side_rows = []
     for pos in sorted(traces):
-        tr = traces[pos]
-        fits = _fit_trace_sides(tr, config, reference=reference)
-        pr = PositionResult(position=pos)
-        stem = files[pos].stem
+        pr = PositionResult(position=pos, n_files=len(traces[pos]))
+        bundles: list[SideBundle] = []
+        for tr in traces[pos]:
+            bundles += _fit_trace_sides(tr, config, reference=reference,
+                                        absolute_mode=absolute_mode)
 
-        for side, ramp, pf, y, sigma in fits:
-            pr.side_fits[side.index] = pf
+        for b in bundles:
+            pr.side_fits.append((b.label, b.peak))
             plotting.plot_side_fit(
-                side, ramp, pf,
-                str(dir_fits / f"{stem}_side{side.index}.png"),
-                title=f"{label} position {stem} — side {side.index}")
+                b.side, b.ramp, b.peak,
+                str(dir_fits / f"{b.label.replace(':', '_')}.png"),
+                title=f"{label} position {pos:g} — {b.label}",
+                y_label="Absorption [%]" if absolute_mode else "Relative absorption [arb. u.]",
+                y_fitted=b.y_used, t_fitted=b.t_used, core=b.core,
+                method=b.method)
+            side_rows.append({
+                "position": pos, "side": b.label,
+                "amplitude": b.peak.amplitude, "amplitude_err": b.peak.amplitude_err,
+                "snr": b.peak.snr, "delta_aic": b.peak.delta_aic,
+                "accepted": b.peak.accepted,
+                "reject_reasons": "; ".join(b.peak.reject_reasons),
+                "core_fraction": float(np.mean(b.core)),
+                "dc_mean_V": b.side.dc_mean,
+            })
 
-        good = [pf for pf in pr.side_fits.values() if pf.accepted]
-        noise = [ramp.sigma_noise for (_, ramp, _, _, _) in fits
-                 if np.isfinite(ramp.sigma_noise)]
+        good = [pf for (_, pf) in pr.side_fits if pf.accepted]
+        noise = [b.sigma_used for b in bundles if np.isfinite(b.sigma_used)]
         pr.noise_floor = float(np.median(noise)) if noise else 0.0
         pr.n_good_sides = len(good)
         pr.accepted = len(good) >= config.min_good_sides
+        dcs = [b.side.dc_mean for b in bundles if b.side.dc_mean is not None]
+        pr.dc_mean = float(np.mean(dcs)) if dcs else None
 
         if pr.accepted:
             amps = np.array([pf.amplitude for pf in good])
@@ -223,36 +387,42 @@ def run_extraction(data_folder: str, output_folder: str, config: AnalysisConfig,
         tag = "ok" if pr.accepted else "REJECTED (noise)"
         _log(progress, f"  position {pr.position:g}: {pr.n_good_sides}/"
                        f"{len(pr.side_fits)} sides good "
-                       f"-> A = {pr.amplitude:.4g} +- {pr.amplitude_err:.2g}  [{tag}]")
+                       f"-> A = {pr.amplitude:.4g} +- {pr.amplitude_err:.2g} {unit}  [{tag}]")
 
     # ── profile table ─────────────────────────────────────────────────────────
     rows = []
     for pr in results:
-        row = {
+        rows.append({
             "position": pr.position,
             "amplitude": pr.amplitude,
             "amplitude_err": pr.amplitude_err,
             "n_good_sides": pr.n_good_sides,
+            "n_sides": len(pr.side_fits),
+            "n_files": pr.n_files,
             "accepted": pr.accepted,
             "noise_floor": pr.noise_floor,
-        }
-        for i, pf in sorted(pr.side_fits.items()):
-            row[f"amp_side{i}"] = pf.amplitude
-            row[f"amp_err_side{i}"] = pf.amplitude_err
-            row[f"snr_side{i}"] = pf.snr
-            row[f"accepted_side{i}"] = pf.accepted
-        rows.append(row)
+            "dc_mean_V": pr.dc_mean,
+        })
     df = pd.DataFrame(rows).sort_values("position").reset_index(drop=True)
     df.to_csv(dir_prof / "absorption_profile.csv", index=False)
-    _log(progress, f"Wrote {dir_prof / 'absorption_profile.csv'}")
-    return df, results
+    pd.DataFrame(side_rows).to_csv(dir_prof / "side_details.csv", index=False)
+    _log(progress, f"Wrote {dir_prof / 'absorption_profile.csv'} (+ side_details.csv)")
+
+    # Transmission diagnostic: the per-point CH2 DC level tracks window
+    # transmission differences across the scan (run format only).
+    if absolute_mode:
+        plotting.plot_transmission(
+            df, str(dir_prof / "transmission_vs_position.png"),
+            title=f"{label} — CH2 DC transmission level vs position")
+    return df, results, absolute_mode
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Stage 4: spatial-profile fits
 # ──────────────────────────────────────────────────────────────────────────────
 def run_profile(df: pd.DataFrame, output_folder: str, config: AnalysisConfig,
-                progress=None, label: str = "") -> dict[str, ProfileFit]:
+                progress=None, label: str = "",
+                absolute_mode: bool = False) -> dict[str, ProfileFit]:
     """Fit the configured models to the spatial profile; save plots."""
     dir_prof = Path(output_folder) / "03_profile"
     dir_prof.mkdir(parents=True, exist_ok=True)
@@ -268,13 +438,15 @@ def run_profile(df: pd.DataFrame, output_folder: str, config: AnalysisConfig,
     else:                       # "zero" (already zeroed upstream) or "keep"
         included = np.ones(len(x), dtype=bool)
 
+    y_label = "Absorption [%]" if absolute_mode else "Relative absorption [arb. u.]"
     fits: dict[str, ProfileFit] = {}
     for model in config.profile_models:
         pf = fit_profile(x, y, e, model, config, included=included, accepted=ok)
         fits[model] = pf
         plotting.plot_profile(pf, config,
                               str(dir_prof / f"profile_{model}.png"),
-                              dataset_label=f"{label} — {model} profile fit")
+                              dataset_label=f"{label} — {model} profile fit",
+                              y_label=y_label)
         _log(progress, f"  {model:>12}: FWHM = {pf.fwhm_mm:.2f} +- {pf.fwhm_mm_err:.2f} mm, "
                        f"theta_1/2 = {pf.theta_half_deg:.3f} +- {pf.theta_half_deg_err:.3f} deg, "
                        f"chi2_red = {pf.chi2_reduced:.2f}"
@@ -313,17 +485,18 @@ def run_flux_extraction(flux_source: str, output_folder: str, config: AnalysisCo
             title=f"flux trace {path.name} — segmentation")
         # Unconstrained fits: the flux trace can have different scan settings
         # than the amplified data, so the reference template is not reused.
-        fits = _fit_trace_sides(tr, config, reference=None, percent_mode=True)
-        for side, ramp, pf, y, sigma in fits:
+        bundles = _fit_trace_sides(tr, config, reference=None, percent_mode=True)
+        for b in bundles:
             plotting.plot_side_fit(
-                side, ramp, pf,
-                str(dir_flux / f"{path.stem}_side{side.index}.png"),
-                title=f"flux {path.stem} — side {side.index}",
-                y_label="Absorption [%]", y_fitted=y)
-            if pf.accepted:
-                amps.append(pf.amplitude)
-        n_acc = sum(1 for (_, _, pf, _, _) in fits if pf.accepted)
-        _log(progress, f"  flux trace {path.name}: {n_acc}/{len(fits)} sides accepted")
+                b.side, b.ramp, b.peak,
+                str(dir_flux / f"{path.stem}_side{b.side.index}.png"),
+                title=f"flux {path.stem} — side {b.side.index}",
+                y_label="Absorption [%]", y_fitted=b.y_used,
+                t_fitted=b.t_used, core=b.core, method=b.method)
+            if b.peak.accepted:
+                amps.append(b.peak.amplitude)
+        n_acc = sum(1 for b in bundles if b.peak.accepted)
+        _log(progress, f"  flux trace {path.name}: {n_acc}/{len(bundles)} sides accepted")
 
     if not amps:
         raise RuntimeError("No flux-trace side passed validation — cannot compute flux.")
@@ -363,10 +536,12 @@ def run_full_pipeline(
     label = label or Path(data_folder).name
 
     _log(progress, f"=== Stage 1-3: extracting absorption profile ({label}) ===")
-    df, _position_results = run_extraction(data_folder, str(out), config, progress, label)
+    df, _position_results, absolute_mode = run_extraction(
+        data_folder, str(out), config, progress, label)
 
     _log(progress, "=== Stage 4: spatial profile fits ===")
-    fits = run_profile(df, str(out), config, progress, label)
+    fits = run_profile(df, str(out), config, progress, label,
+                       absolute_mode=absolute_mode)
 
     # ── optional Zone 2 for Method B ─────────────────────────────────────────
     fits2, method_b = {}, {}
@@ -375,9 +550,10 @@ def run_full_pipeline(
         out2 = out / "zone2"
         cfg2 = AnalysisConfig(**{**config.__dict__})
         cfg2.z_probe_in = config.z_probe2_in    # geometry of the far zone
-        df2, _ = run_extraction(zone2_folder, str(out2), cfg2, progress,
-                                label=f"{label}-zone2")
-        fits2 = run_profile(df2, str(out2), cfg2, progress, f"{label}-zone2")
+        df2, _, abs2 = run_extraction(zone2_folder, str(out2), cfg2, progress,
+                                      label=f"{label}-zone2")
+        fits2 = run_profile(df2, str(out2), cfg2, progress, f"{label}-zone2",
+                            absolute_mode=abs2)
         for model in fits:
             if model in fits2:
                 th, th_err = divergence_method_b(
@@ -386,10 +562,15 @@ def run_full_pipeline(
                 method_b[model] = {"theta_half_deg": th, "theta_half_deg_err": th_err}
                 _log(progress, f"  Method B ({model}): theta_1/2 = {th:.3f} +- {th_err:.3f} deg")
 
-    # ── optional absolute flux ────────────────────────────────────────────────
+    # ── absolute flux ─────────────────────────────────────────────────────────
+    # Absolute-mode runs carry true percent absorption at every position, so
+    # the flux comes straight from the fitted profile — no calibration trace
+    # needed. A flux trace, if explicitly given, takes precedence (legacy path).
     flux_results = {}
+    flux_source_used = None
     if flux_source:
-        _log(progress, "=== Stage 5: absolute flux ===")
+        _log(progress, "=== Stage 5: absolute flux (from calibration trace) ===")
+        flux_source_used = "trace"
         absorption_frac, ref_pos = run_flux_extraction(flux_source, str(out), config, progress)
         if ref_pos is None:
             ref_pos = fits[list(fits)[0]].center
@@ -398,6 +579,16 @@ def run_full_pipeline(
             fr = flux_from_profile(absorption_frac, pf, config, ref_pos)
             flux_results[model] = fr
             _log(progress, f"  {model:>12}: Rb flux = {fr.rb_flux_atoms_s:.2e} atoms/s"
+                           + (f", dopant density = {fr.dopant_density_cm3:.2e} cm^-3"
+                              if fr.dopant_density_cm3 is not None else ""))
+    elif absolute_mode:
+        _log(progress, "=== Stage 5: absolute flux (from absolute profile) ===")
+        flux_source_used = "profile"
+        for model, pf in fits.items():
+            fr = flux_from_absolute_profile(pf, config)
+            flux_results[model] = fr
+            _log(progress, f"  {model:>12}: peak absorption = {fr.absorption_frac * 100:.3f} %, "
+                           f"Rb flux = {fr.rb_flux_atoms_s:.2e} atoms/s"
                            + (f", dopant density = {fr.dopant_density_cm3:.2e} cm^-3"
                               if fr.dopant_density_cm3 is not None else ""))
 
@@ -409,6 +600,8 @@ def run_full_pipeline(
                               dataset_label=f"{label} | {model}")
 
     results = {"label": label, "data_folder": str(data_folder),
+               "absorption_mode": "absolute" if absolute_mode else "relative",
+               "flux_source": flux_source_used,
                "zone1": {}, "zone2": {}, "method_b": method_b, "flux": {}}
     for model, pf in fits.items():
         results["zone1"][model] = {

@@ -1,18 +1,28 @@
 """
 Loading and segmenting raw oscilloscope traces.
 
-Two on-disk formats are supported transparently:
+Three on-disk formats are supported transparently:
 
-1. Standard export with an explicit time column:
+1. Legacy export with an explicit time column:
        Time(s),CH2(V),CH4(V)
        -3.2844E-03,-1.156769E-01,4.061519E+00
        ...
 
-2. "Raw" export where the header encodes the time base and the file holds only
-   samples (seen as `full0.csv` in the old data):
+2. Legacy "raw" export where the header encodes the time base and the file
+   holds only samples (seen as `full0.csv` in the old data):
        CH2(V), t0 = -0.0040844s,  tInc = 5e-10s,
        -0.36...
    Here time is reconstructed as t = t0 + i*tInc.
+
+3. Acquisition-runner "run" format (2026-07 onward, op-amp bypassed): a
+   `#`-comment metadata header followed by four columns:
+       # timestamp: ...
+       # target_in: 0.20000
+       time_s,CH2_V,CH3_V,CH4_V
+   CH2 is the raw DC photodetector level (used to normalize to absolute
+   absorption), CH3 the AC-coupled copy that resolves the peaks (fitted),
+   CH4 the sync. The stage position comes from `target_in` (inches) and is
+   converted to thou so all downstream geometry is unchanged.
 
 Segmentation: the Toptica scan controller outputs a square-wave sync (recorded
 on CH4) whose level flips at every sawtooth turning point, so each constant-
@@ -44,6 +54,10 @@ class RampSide:
     v: np.ndarray             # signal [V], bin-averaged
     t_start: float            # untrimmed boundaries in the original trace
     t_end: float
+    # DC transmission level over this side (run format only): mean of the raw
+    # CH2 channel and its uncertainty (scatter + ADC quantization).
+    dc_mean: float | None = None
+    dc_err: float | None = None
 
 
 @dataclass
@@ -54,6 +68,9 @@ class Trace:
     v: np.ndarray             # signal [V]
     sync: np.ndarray | None   # sync channel [V], or None if absent
     sides: list = field(default_factory=list)   # list[RampSide], filled by segment()
+    dc: np.ndarray | None = None    # raw DC photodetector channel (run format)
+    meta: dict = field(default_factory=dict)    # '# key: value' header metadata
+    position_thou: float | None = None          # stage position from metadata [thou]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -78,17 +95,67 @@ def _bin_average(t: np.ndarray, v: np.ndarray, n_bins: int):
     return t_out[good] / counts[good], v_out[good] / counts[good]
 
 
-def load_trace(path: str, config: AnalysisConfig) -> Trace:
-    """Load one scope CSV in either supported format.
+# Column roles in the run format (op-amp bypassed, raw + AC-coupled channels).
+RUN_TIME_COL = "time_s"
+RUN_DC_COL = "CH2_V"      # raw DC photodetector level
+RUN_SIGNAL_COL = "CH3_V"  # AC-coupled signal — this is what gets fitted
+RUN_SYNC_COL = "CH4_V"
+IN_TO_THOU = 1000.0
 
-    An explicit time column always wins; the t0/tInc header form is only used
-    when no time column exists (some scope exports carry a leftover
-    "t0 = ..., tInc = ..." fragment in the header even WITH a time column).
+
+def read_run_metadata(path: str) -> dict:
+    """Parse the leading '# key: value' comment lines of a run-format CSV."""
+    meta: dict = {}
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if not line.startswith("#"):
+                break
+            if ":" in line:
+                k, v = line[1:].split(":", 1)
+                meta[k.strip()] = v.strip()
+    return meta
+
+
+def load_trace(path: str, config: AnalysisConfig) -> Trace:
+    """Load one scope CSV in any supported format.
+
+    Run-format files are recognized by their `time_s` column (plus optional
+    `#` metadata header). For legacy files an explicit time column always
+    wins; the t0/tInc header form is only used when no time column exists
+    (some scope exports carry a leftover "t0 = ..., tInc = ..." fragment in
+    the header even WITH a time column).
     """
-    # Peek at the header line to decide which format this is.
+    # Skip any leading '#' metadata lines, then peek at the header line.
+    meta = read_run_metadata(path)
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
         header = fh.readline()
+        while header.startswith("#"):
+            header = fh.readline()
     header_cols = [c.strip() for c in header.split(",")]
+
+    dc = None
+    position_thou = None
+    if RUN_TIME_COL in header_cols and RUN_SIGNAL_COL in header_cols:
+        # ── run format ────────────────────────────────────────────────────────
+        df = pd.read_csv(path, comment="#")
+        df.columns = [c.strip() for c in df.columns]
+        t = df[RUN_TIME_COL].to_numpy(dtype=float)
+        v = df[RUN_SIGNAL_COL].to_numpy(dtype=float)
+        dc = df[RUN_DC_COL].to_numpy(dtype=float) if RUN_DC_COL in df.columns else None
+        sync = df[RUN_SYNC_COL].to_numpy(dtype=float) if RUN_SYNC_COL in df.columns else None
+        order = np.argsort(t, kind="stable")
+        t, v = t[order], v[order]
+        if dc is not None:
+            dc = dc[order]
+        if sync is not None:
+            sync = sync[order]
+        if "target_in" in meta:
+            try:
+                position_thou = float(meta["target_in"]) * IN_TO_THOU
+            except ValueError:
+                pass
+        return Trace(path=str(path), t=t, v=v, sync=sync, dc=dc,
+                     meta=meta, position_thou=position_thou)
 
     if config.time_column in header_cols:
         df = pd.read_csv(path)
@@ -312,6 +379,15 @@ def segment(trace: Trace, config: AnalysisConfig) -> Trace:
     durations = np.diff(bounds)
     typical = np.median(durations) if len(durations) else 0.0
 
+    # ADC quantization step of the DC channel: the raw CH2 record is heavily
+    # quantized (few distinct levels), so the LSB size — not the sample scatter
+    # alone — limits how well the DC level is known.
+    dc_lsb = 0.0
+    if trace.dc is not None:
+        levels = np.unique(trace.dc)
+        if len(levels) > 1:
+            dc_lsb = float(np.min(np.diff(levels)))
+
     sides: list[RampSide] = []
     for t0, t1 in zip(bounds[:-1], bounds[1:]):
         if (t1 - t0) < 0.6 * typical:
@@ -321,7 +397,14 @@ def segment(trace: Trace, config: AnalysisConfig) -> Trace:
         if sel.sum() < 50:
             continue
         ts, vs = _bin_average(trace.t[sel], trace.v[sel], config.downsample_points_per_side)
-        sides.append(RampSide(index=len(sides) + 1, t=ts, v=vs, t_start=t0, t_end=t1))
+        dc_mean = dc_err = None
+        if trace.dc is not None:
+            dseg = trace.dc[sel]
+            dc_mean = float(np.mean(dseg))
+            # Scatter of the mean, floored at half an LSB (quantization limit).
+            dc_err = max(float(np.std(dseg) / np.sqrt(len(dseg))), 0.5 * dc_lsb)
+        sides.append(RampSide(index=len(sides) + 1, t=ts, v=vs, t_start=t0, t_end=t1,
+                              dc_mean=dc_mean, dc_err=dc_err))
 
     trace.sides = sides
     return trace

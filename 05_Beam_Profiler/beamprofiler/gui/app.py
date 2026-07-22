@@ -110,9 +110,9 @@ class BeamProfilerApp(tk.Tk):
                     row=row, column=3, sticky="w", padx=4)
 
         picker_row(0, "Data folder (position CSVs)", self.var_data,
-                   tip="folder with 000.csv ... 900.csv")
+                   tip="run folder (point_0001.csv ...) or legacy 000.csv ... 900.csv")
         picker_row(1, "Flux trace file or folder", self.var_flux, is_dir=False, optional=True,
-                   tip="unattenuated trace; Browse picks a file — paste a folder path for many")
+                   tip="legacy calibration trace — run-format data computes flux from the profile")
         picker_row(2, "Zone 2 folder (Method B)", self.var_zone2, optional=True,
                    tip="second-distance scan for two-zone divergence")
         picker_row(3, "Output folder", self.var_out,
@@ -127,7 +127,7 @@ class BeamProfilerApp(tk.Tk):
 
         fit_box = ttk.LabelFrame(mid, text="Fitting")
         fit_box.grid(row=0, column=0, sticky="nsew", padx=4)
-        self.var_degree = tk.StringVar(value="2")
+        self.var_degree = tk.StringVar(value="auto")
         self.var_offset = tk.BooleanVar(value=True)
         self.var_error = tk.StringVar(value="STD")
         self.var_seg = tk.StringVar(value="sync")
@@ -135,11 +135,25 @@ class BeamProfilerApp(tk.Tk):
         self.var_daic = tk.StringVar(value="6.0")
         self.var_minsides = tk.StringVar(value="2")
         self.var_rejmode = tk.StringVar(value="zero")
-        _add_combo(fit_box, 0, "Ramp poly degree", self.var_degree, ["1", "2"],
-                   "2 handles filter-curvature; 1 for plain linear ramps")
+        self.var_autotrim = tk.BooleanVar(value=True)
+        self.var_bgmethod = tk.StringVar(value="corners")
+        self.var_absmode = tk.StringVar(value="auto")
+        self.var_dark = tk.StringVar(value="0.0")
+        _add_combo(fit_box, 0, "Ramp poly degree", self.var_degree, ["auto", "1", "2"],
+                   "auto: 1 for raw run data, 2 for legacy amplified data")
         r = 1
         cb = ttk.Checkbutton(fit_box, text="Allow offset in peak fit", variable=self.var_offset)
         cb.grid(row=r, column=0, columnspan=2, sticky="w", padx=4, pady=2); r += 1
+        cb2 = ttk.Checkbutton(fit_box, text="Auto-trim curved ramp ends", variable=self.var_autotrim)
+        cb2.grid(row=r, column=0, columnspan=2, sticky="w", padx=4, pady=2); r += 1
+        _add_combo(fit_box, r, "Background fit", self.var_bgmethod,
+                   ["corners", "wings", "masked"],
+                   "corners = line through turn-point clusters (recommended)"); r += 1
+        _add_combo(fit_box, r, "Absorption scale", self.var_absmode,
+                   ["auto", "absolute", "relative"],
+                   "auto = absolute (CH3/CH2) when a DC channel exists"); r += 1
+        _add_entry(fit_box, r, "Dark offset [V]", self.var_dark,
+                   tip="photodiode dark level subtracted from CH2"); r += 1
         _add_combo(fit_box, r, "Point error", self.var_error, ["STD", "SEM"],
                    "STD = side-to-side scatter (thesis choice)"); r += 1
         _add_combo(fit_box, r, "Segmentation", self.var_seg, ["sync", "auto"],
@@ -210,8 +224,13 @@ class BeamProfilerApp(tk.Tk):
     # ── config <-> widgets ────────────────────────────────────────────────────
     def _collect_config(self) -> AnalysisConfig:
         cfg = AnalysisConfig()
-        cfg.ramp_degree = int(self.var_degree.get())
+        deg = self.var_degree.get()
+        cfg.ramp_degree = deg if deg == "auto" else int(deg)
         cfg.fit_peak_offset = self.var_offset.get()
+        cfg.auto_trim = self.var_autotrim.get()
+        cfg.background_method = self.var_bgmethod.get()
+        cfg.absorption_mode = self.var_absmode.get()
+        cfg.dark_offset_V = float(self.var_dark.get() or 0.0)
         cfg.error_mode = self.var_error.get()
         cfg.segmentation = self.var_seg.get()
         cfg.snr_min = float(self.var_snr.get())
@@ -239,8 +258,15 @@ class BeamProfilerApp(tk.Tk):
         return cfg
 
     def _apply_config(self, cfg: AnalysisConfig):
-        self.var_degree.set(str(cfg.ramp_degree))
+        self.var_degree.set(str(cfg.ramp_degree)
+                            if str(cfg.ramp_degree) in ("auto", "1", "2") else "auto")
         self.var_offset.set(cfg.fit_peak_offset)
+        self.var_autotrim.set(cfg.auto_trim)
+        self.var_bgmethod.set(cfg.background_method
+                              if cfg.background_method in ("corners", "wings", "masked")
+                              else "corners")
+        self.var_absmode.set(cfg.absorption_mode)
+        self.var_dark.set(str(cfg.dark_offset_V))
         self.var_error.set(cfg.error_mode)
         self.var_seg.set(cfg.segmentation if cfg.segmentation in ("sync", "auto") else "sync")
         self.var_snr.set(str(cfg.snr_min))

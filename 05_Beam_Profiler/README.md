@@ -10,10 +10,13 @@ with every intermediate step saved as an image you can audit.
 ```
 raw scope CSVs (one per probe position)
    │  1. segment each trace into ramp sides (robust triangle-wave fit)
-   │  2. remove the sawtooth background (auto-masked polynomial)
-   │  3. fit the Lorentzian absorption peak (+ statistical noise rejection)
+   │  2. remove the linear background (line through point clusters
+   │     at the ramp turn points)
+   │  3. fit the Lorentzian absorption peak (+ statistical noise rejection);
+   │     run-format data: normalize by the CH2 DC level → TRUE absorption %
    │  4. build & fit the spatial profile A(Δy)  →  divergence, capture eff.
-   │  5. (optional) absolute flux from an unattenuated reference trace
+   │  5. absolute flux — directly from the absolute profile (run format),
+   │     or from an unattenuated reference trace (legacy)
    ▼
 results folder: stage images + absorption_profile.csv + summary plots + results.json
 ```
@@ -48,6 +51,10 @@ Settings can be saved/loaded as JSON so a whole analysis is reproducible.
 ## Quick start — command line
 
 ```
+# run-format folder (absolute absorption, flux straight from the profile):
+python run_pipeline.py --data run_20260716_182706 --out results\run_071626 ^
+    --label Rb_071626
+
 # divergence + flux + dopant density for the dual-species run:
 python run_pipeline.py ^
     --data ..\04_Beam_Characterization\absorption_data\data_112825 ^
@@ -69,16 +76,49 @@ python run_pipeline.py ^
 
 ## Input data format
 
+Both layouts are auto-detected per folder — no switches needed.
+
+### Run format (2026-07 onward, op-amp bypassed — preferred)
+
+A folder written by the acquisition runner (`run_YYYYMMDD_HHMMSS/`) with one
+`point_NNNN.csv` per scan step:
+
+```
+# timestamp: 2026-07-16 18:30:11.203
+# step: 1
+# pass: 1
+# target_in: 0.20000
+time_s,CH2_V,CH3_V,CH4_V
+```
+
+* `CH2` — **raw DC photodetector level** (no amplifier). Sets the absolute
+  transmission scale per point, so window-transmission differences across the
+  viewport are normalized out automatically.
+* `CH3` — **AC-coupled copy** of the same signal at fine vertical scale; this
+  is what the ramp removal and peak fits run on.
+* `CH4` — scan-controller sync square wave.
+* Probe position comes from the `target_in` header (inches; converted to thou
+  internally). Multiple files at the same position (multi-pass scans) are
+  combined into one profile point.
+
+Every side fit reports **true percent absorption** (CH3 dip ÷ CH2 DC level),
+so the spatial profile is absolute and the **flux is computed directly from
+the profile** — no separate calibration trace needed.
+
+### Legacy format
+
 * **Position scans** — one CSV per probe height, named by the translation-stage
   position in thou (e.g. `450.csv`). Standard scope export with columns
   `Time(s), CH2(V), CH4(V)`:
   * `CH2` — (amplified) photodetector signal,
   * `CH4` — scan-controller sync square wave (optional but recommended).
   Files with non-numeric names (`full0.csv`, `RelativeAbsNear.csv`, notes, …)
-  in the same folder are ignored automatically.
+  in the same folder are ignored automatically. Absorption is relative.
 * **Flux traces** — unattenuated (amplifier bypassed) traces at one reference
   position; either the same `Time(s),CH2(V),CH4(V)` format or the raw scope
   export with `t0 = …, tInc = …` encoded in the header. Both are handled.
+  (A flux trace can also be given for run-format data — it then overrides the
+  profile-based flux.)
 
 ## What was improved vs. the old notebooks
 
@@ -93,10 +133,19 @@ profile tails (thesis Sec. 5.3). This package replaces those steps:
    itself: the trace is folded by the period and fit with an ideal triangle
    wave using a robust soft-L1 loss, so even a very deep absorption dip cannot
    pull the corners. No hard-coded time windows anywhere.
-2. **Automatic background removal.** The polynomial (degree 1 or 2) is fit with
-   iterative sigma-clipping that finds and masks the absorption feature itself;
-   on weak positions the mask is pre-seeded from the reference peak so a
-   below-noise dip can never bias the background.
+2. **Corner-anchored background removal.** The triangle-wave amplitude is
+   measured directly: a small cluster of points at each end of the side (just
+   off the ramp turn points) is averaged and the background is the straight
+   line through the two cluster means. Nothing is masked and nothing is fit
+   iteratively, so there are no per-side decisions to jitter between sweeps —
+   on the 2026 run data this gives the best side-to-side reproducibility
+   (4.3 % scatter vs 5.8 % for a wing fit and 9.2 % for sigma-clip masking),
+   at the cost of a ~+2 % amplitude offset from the reproducible corner
+   rounding (verified against a simultaneous line+Lorentzian fit). Two
+   alternatives remain selectable: `background_method: "wings"` (polynomial
+   fit to all points ≥ `wing_inner_gammas`×Γ from the peak) and `"masked"`
+   (the sigma-clip method, also the automatic fallback for degree-2 legacy
+   backgrounds where a straight line does not apply).
 3. **Reference-peak bootstrapping.** The strongest position is found and fit
    unconstrained, then its linewidth and peak position (as a fraction of the
    sweep) become initial guesses *and bounds* for every other position —
@@ -112,12 +161,21 @@ profile tails (thesis Sec. 5.3). This package replaces those steps:
    (configurable: `zero` / `exclude` / `keep`). Rejected points are drawn in
    red on the profile plots. On the 2025 datasets this correctly removes the
    positions (e.g. 700–900 in the Rb-Ar run) that previously fit noise.
-5. **Pseudo-Voigt tiebreaker.** Enable the third model to get a mixing
+5. **Automatic linear-core detection (run-format data).** Optics
+   imperfections curve the first/last ~10–20 % of each nominally linear ramp
+   side by several times the noise — enough to masquerade as signal. Each
+   side's background is anchored on its central half, the smoothed residuals
+   are compared against their *measured* noise (the CH3 etalon ripple is
+   correlated, so a white-noise estimate would be wrong), and the curved ends
+   are walked off until the data is provably polynomial. The known peak window
+   is exempt, and trims are capped (`auto_trim_max_fraction`). Trimmed regions
+   are drawn gray on every `02_side_fits` image.
+6. **Pseudo-Voigt tiebreaker.** Enable the third model to get a mixing
    parameter η that interpolates Gaussian (η=0) → Lorentzian (η=1) — a direct,
    quantitative answer to "is the profile really Lorentzian?" once the noise
    points are handled. (On the Rb-Ar Zone 1 data: η ≈ 1.0, i.e. the Lorentzian
    preference survives noise rejection.)
-6. **One command / one click end-to-end**, with every stage image saved and a
+7. **One command / one click end-to-end**, with every stage image saved and a
    machine-readable `results.json` + the exact `config_used.json` per run.
 
 ## Output layout
@@ -129,10 +187,14 @@ profile tails (thesis Sec. 5.3). This package replaces those steps:
 ├── 02_side_fits/             per position & side: background fit (top) and
 │                             Lorentzian fit with ACCEPT/REJECT verdict (bottom)
 ├── 03_profile/
-│   ├── absorption_profile.csv  per-position amplitudes, errors, per-side
-│   │                           details, accepted flags
+│   ├── absorption_profile.csv  per-position amplitudes, errors, accepted flags,
+│   │                           CH2 DC level (run format)
+│   ├── side_details.csv        long-format per-side fit details (amplitude,
+│   │                           SNR, verdicts, trim fraction, DC level)
+│   ├── transmission_vs_position.png  CH2 DC level vs position (run format)
 │   └── profile_<model>.png     spatial profile fit + parameter table
 ├── 04_flux/                  flux-trace segmentation and absorption-% fits
+│                             (legacy calibration-trace runs only)
 ├── zone2/                    same structure for the Zone 2 data (if given)
 ├── summary_<model>.png       final column-density profile + full results table
 └── results.json              all numbers, machine-readable
@@ -170,7 +232,16 @@ fits = run_profile(df, "results/rb_ar_112825", cfg, progress=print)
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `ramp_degree` | 2 | background polynomial; 2 absorbs the RC-filter curvature, 1 for plain ramps |
+| `ramp_degree` | `auto` | background polynomial: auto = 1 for run-format (raw) data, 2 for legacy (RC-filter curvature); or set 1/2 explicitly |
+| `absorption_mode` | `auto` | `absolute` (CH3 dip / CH2 DC), `relative`, or auto by format |
+| `dark_offset_V` | 0.0 | photodiode dark level subtracted from CH2 before normalizing |
+| `background_method` | `corners` | line through turn-point clusters; `wings` = fit clusters flanking the peak; `masked` = legacy sigma-clip |
+| `corner_cluster_fraction` | 0.05 | cluster size at each side end (corners method) |
+| `corner_fit_exclude_fraction` | 0.15 | side-end fraction kept out of the peak fit (corners method) |
+| `wing_inner_gammas` | 4.0 | wing clusters start this many HWHM from the peak centre |
+| `auto_trim` | True | trim curved ramp ends via linear-core detection |
+| `auto_trim_max_fraction` | 0.30 | cap on the auto-trim per side end |
+| `auto_trim_sigma` | 2.5 | trim threshold in units of measured smoothed-residual noise |
 | `fit_peak_offset` | True | constant offset in the Lorentzian peak fit |
 | `snr_min` | 3.0 | reject side fits below this amplitude/noise ratio |
 | `delta_aic_min` | 6.0 | peak model must beat background-only by this AIC margin |

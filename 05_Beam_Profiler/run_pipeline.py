@@ -36,6 +36,17 @@ def main() -> int:
     # A few common settings as direct flags:
     ap.add_argument("--ramp-degree", type=int, choices=[1, 2],
                     help="background polynomial degree (default 2)")
+    ap.add_argument("--absorption-mode", choices=["auto", "absolute", "relative"],
+                    help="absolute = CH3 dip / CH2 DC level (run format); "
+                         "auto picks absolute whenever a DC channel exists")
+    ap.add_argument("--dark-offset", type=float,
+                    help="photodiode dark level [V] subtracted from CH2 (default 0)")
+    ap.add_argument("--no-auto-trim", action="store_true",
+                    help="disable automatic trimming of curved ramp ends")
+    ap.add_argument("--background", choices=["corners", "wings", "masked"],
+                    help="background method: corners = line through turn-point "
+                         "clusters (default), wings = clusters flanking the peak, "
+                         "masked = legacy sigma-clip")
     ap.add_argument("--z-probe", type=float,
                     help="nozzle->probe distance in inches (2.46 near, 12.3 far)")
     ap.add_argument("--oven-temp", type=float, help="nozzle temperature in C")
@@ -58,6 +69,14 @@ def main() -> int:
     config = AnalysisConfig.load(args.config) if args.config else AnalysisConfig()
     if args.ramp_degree is not None:
         config.ramp_degree = args.ramp_degree
+    if args.absorption_mode is not None:
+        config.absorption_mode = args.absorption_mode
+    if args.dark_offset is not None:
+        config.dark_offset_V = args.dark_offset
+    if args.no_auto_trim:
+        config.auto_trim = False
+    if args.background is not None:
+        config.background_method = args.background
     if args.z_probe is not None:
         config.z_probe_in = args.z_probe
     if args.oven_temp is not None:

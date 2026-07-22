@@ -60,27 +60,52 @@ def plot_trace_segmentation(trace, path: str, title: str = "") -> str:
 
 def plot_side_fit(side, ramp_fit, peak_fit, path: str, title: str = "",
                   y_label: str = "Relative absorption [arb. u.]",
-                  y_fitted=None) -> str:
+                  y_fitted=None, t_fitted=None, core=None,
+                  method: str = "masked") -> str:
     """Two-panel stage plot for one ramp side (stages 2+3).
 
-    Top:    raw side with the fitted polynomial background; the automatically
-            masked feature region is shaded.
-    Bottom: the signal that was actually fit (pass `y_fitted` when it differs
-            from the plain subtracted voltage, e.g. percent absorption for
-            flux traces) with the Lorentzian fit and the accept/reject verdict.
+    Top:    full raw side with the fitted polynomial background. Region
+            shading depends on the background method:
+              * "corners"/"wings" — the anchor clusters the background was
+                           fit to are shaded green; the middle is interpolated.
+              * "masked" — the sigma-clip/pre-seeded feature mask (excluded
+                           from the fit) is shaded green.
+            Auto-trimmed curved ramp ends (excluded from everything) are gray.
+    Bottom: the signal that was actually fit — over the linear core when
+            `t_fitted`/`core` are given (pass `y_fitted` when it differs from
+            the plain subtracted voltage, e.g. percent absorption) with the
+            Lorentzian fit and the accept/reject verdict.
     """
-    t_ms = side.t * 1e3
+    t_fit = side.t if t_fitted is None else t_fitted
+    t_full_ms = side.t * 1e3
+    t_ms = t_fit * 1e3
     y_bottom = ramp_fit.subtracted if y_fitted is None else y_fitted
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 6), sharex=True,
                                    gridspec_kw={"hspace": 0.08})
 
-    ax1.plot(t_ms, side.v, ".", ms=1.5, color=DATA_COLOR, label="raw data")
-    ax1.plot(t_ms, ramp_fit.background, color=MASK_COLOR, lw=1.5,
+    # The ramp fit may cover the full side ("corners": anchors at the ends,
+    # peak fit on the interior) or just the fitted window — pick the matching
+    # time axis by length.
+    t_ramp_ms = t_full_ms if len(ramp_fit.background) == len(side.t) else t_ms
+
+    ax1.plot(t_full_ms, side.v, ".", ms=1.5, color=DATA_COLOR, label="raw data")
+    ax1.plot(t_ramp_ms, ramp_fit.background, color=MASK_COLOR, lw=1.5,
              label=f"background (deg {len(ramp_fit.coeffs) - 1})")
-    if ramp_fit.mask_feature.any():
+    if method in ("wings", "corners"):
+        anchors = ~ramp_fit.mask_feature
+        if anchors.any():
+            tag = "corner" if method == "corners" else "wing"
+            ax1.fill_between(t_ramp_ms, *ax1.get_ylim(), where=anchors, color=MASK_COLOR,
+                             alpha=0.15, label=f"{tag} anchors (background fit)")
+    elif ramp_fit.mask_feature.any():
         m = ramp_fit.mask_feature
-        ax1.fill_between(t_ms, *ax1.get_ylim(), where=m, color=MASK_COLOR,
+        ax1.fill_between(t_ramp_ms, *ax1.get_ylim(), where=m, color=MASK_COLOR,
                          alpha=0.15, label="masked (feature)")
+    if core is not None and not core.all():
+        label_trim = ("excluded from peak fit" if method == "corners"
+                      else "trimmed (curved ramp end)")
+        ax1.fill_between(t_full_ms, *ax1.get_ylim(), where=~core, color="gray",
+                         alpha=0.18, label=label_trim)
     ax1.set_ylabel("Signal [V]", fontsize=10)
     ax1.legend(fontsize=8, loc="best")
     ax1.set_title(title, fontsize=9, color="gray")
@@ -88,7 +113,7 @@ def plot_side_fit(side, ramp_fit, peak_fit, path: str, title: str = "",
     ax2.plot(t_ms, y_bottom, ".", ms=1.5, color=DATA_COLOR, label="data − background")
     if peak_fit.popt is not None:
         color = FIT_COLOR if peak_fit.accepted else BAD_COLOR
-        ax2.plot(t_ms, peak_fit.curve(side.t), color=color, lw=1.8, label="Lorentzian fit")
+        ax2.plot(t_ms, peak_fit.curve(t_fit), color=color, lw=1.8, label="Lorentzian fit")
         verdict = "ACCEPTED" if peak_fit.accepted else "REJECTED: " + "; ".join(peak_fit.reject_reasons)
         info = (f"A = {peak_fit.amplitude:.3g} ± {peak_fit.amplitude_err:.2g}   "
                 f"SNR = {peak_fit.snr:.1f}   ΔAIC = {peak_fit.delta_aic:.0f}\n{verdict}")
@@ -101,6 +126,23 @@ def plot_side_fit(side, ramp_fit, peak_fit, path: str, title: str = "",
     ax2.set_xlabel("Laser scan time [ms]", fontsize=10)
     ax2.set_ylabel(y_label, fontsize=10)
     ax2.legend(fontsize=8, loc="upper right")
+    return _save(fig, path)
+
+
+def plot_transmission(df, path: str, title: str = "") -> str:
+    """CH2 DC transmission level vs stage position (run format only).
+
+    Differences between points are window-transmission variations across the
+    viewport — exactly what the per-side absolute normalization divides out.
+    """
+    d = df.dropna(subset=["dc_mean_V"]).sort_values("position")
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.plot(d["position"], d["dc_mean_V"], "o-", ms=5, color=FIT_COLOR)
+    ax.set_xlabel("Stage position [thou]", fontsize=11)
+    ax.set_ylabel("CH2 DC level [V]", fontsize=11)
+    ax.set_title(title, fontsize=9, color="gray")
+    ax.grid(ls="--", alpha=0.4)
+    ax.minorticks_on()
     return _save(fig, path)
 
 
