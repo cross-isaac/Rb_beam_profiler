@@ -279,11 +279,12 @@ def plot_summary(pf, flux_result, config: AnalysisConfig, path: str,
     inc = pf.included
     ax.errorbar((pf.x[inc] - x0) / upm, rescale * pf.y[inc], yerr=rescale * pf.y_err[inc],
                 fmt="x", ms=5, capsize=2, ls="None", color=FIT_COLOR, label="data")
-    x_fit = np.linspace(pf.x.min() - 0.05 * np.ptp(pf.x), pf.x.max() + 0.05 * np.ptp(pf.x), 1500)
+    x_fit = np.linspace(pf.x.min() - 0.1 * np.ptp(pf.x), pf.x.max() + 0.1 * np.ptp(pf.x), 1500)
     ax.plot((x_fit - x0) / upm, rescale * pf.curve(x_fit), color=FIT_COLOR, lw=1.8,
             label=f"{pf.model.replace('_', '-')} fit")
     ax.set_xlabel(r"$\Delta y$ [mm]", fontsize=13)
     ax.set_ylabel(y_label, fontsize=13)
+    ax.set_xlim(-12,12)
     ax.minorticks_on()
     ax.tick_params(direction="in", top=True, right=True)
     ax.grid(which="major", ls="--", alpha=0.4)
