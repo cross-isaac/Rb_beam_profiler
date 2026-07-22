@@ -20,6 +20,7 @@ from __future__ import annotations
 import csv
 import json
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -35,16 +36,32 @@ try:
 except ImportError:  # pragma: no cover
     Image = ImageTk = None
 
-# Pseudo-stages in the browser's stage list, alongside the real output folders.
-PICKER_STAGE = "(profile picker)"
+# Pseudo-stage in the browser's stage list, alongside the real output folders.
 FINAL_STAGE = "(final summaries)"
 ALL_POSITIONS = "all positions"
+PROFILE_STAGE = "03_profile"       # the stage whose profile_*.png images are made clickable
 
 
-def _empty_offsets():
-    """An empty (0, 2) offsets array for clearing a scatter highlight."""
-    import numpy as np
-    return np.empty((0, 2))
+def _reconstruct_curve(model: str, params: dict, x_thou):
+    """Rebuild a profile model curve from the params saved in results.json.
+
+    Used to redraw the fit in the browser's interactive profile without re-running
+    the fit. `params` are the `zone1[model].params` from results.json (keys A, x0,
+    FWHM, optionally eta and offset); x is in stage units [thou], as fitted.
+    """
+    from ..profile_analysis import (gaussian_profile, lorentzian_profile,
+                                    pseudo_voigt_profile)
+    A = params.get("A", 0.0)
+    x0 = params.get("x0", 0.0)
+    fwhm = params.get("FWHM", 1.0)
+    off = params.get("offset", 0.0)
+    if model == "lorentzian":
+        y = lorentzian_profile(x_thou, A, x0, fwhm)
+    elif model == "pseudo_voigt":
+        y = pseudo_voigt_profile(x_thou, A, x0, fwhm, params.get("eta", 0.5))
+    else:
+        y = gaussian_profile(x_thou, A, x0, fwhm)
+    return y + off
 
 
 def _add_entry(parent, row, label, var, width=12, tip=""):
@@ -122,6 +139,7 @@ class BeamProfilerApp(tk.Tk):
         self.var_gammamax = tk.StringVar(value="2.5")
         self.var_runaway = tk.StringVar(value="0.97")
         self.var_minsides = tk.StringVar(value="1")
+        self.var_verdict = tk.StringVar(value="auto")
         self.var_rejmode = tk.StringVar(value="zero")
         self.var_error = tk.StringVar(value="STD")
         self.var_useover = tk.BooleanVar(value=True)
@@ -143,6 +161,8 @@ class BeamProfilerApp(tk.Tk):
                    tip="reject at HWHM >= this x the max (1.0 = only exactly pinned, 0 = off)"); r += 1
         _add_entry(fit_box, r, "Min good sides", self.var_minsides,
                    tip="fewer -> position flagged (red)"); r += 1
+        _add_combo(fit_box, r, "Verdict mode", self.var_verdict, ["auto", "flag"],
+                   "auto = reject failing sides; flag = accept all, mark suspects for review"); r += 1
         _add_combo(fit_box, r, "Rejected sides", self.var_rejmode, ["zero", "exclude", "keep"],
                    "zero = count a failed side as 0 and average it in"); r += 1
         _add_combo(fit_box, r, "Point error", self.var_error, ["STD", "SEM", "upper_bound"],
@@ -207,6 +227,7 @@ class BeamProfilerApp(tk.Tk):
         cfg.delta_aic_min = float(self.var_daic.get())
         cfg.gamma_rel_bounds = (cfg.gamma_rel_bounds[0], float(self.var_gammamax.get()))
         cfg.linewidth_runaway_fraction = float(self.var_runaway.get())
+        cfg.side_verdict_mode = self.var_verdict.get()
         cfg.use_manual_overrides = self.var_useover.get()
         cfg.min_good_sides = int(self.var_minsides.get())
         cfg.rejected_mode = self.var_rejmode.get()
@@ -236,6 +257,7 @@ class BeamProfilerApp(tk.Tk):
         self.var_daic.set(str(cfg.delta_aic_min))
         self.var_gammamax.set(str(cfg.gamma_rel_bounds[1]))
         self.var_runaway.set(str(cfg.linewidth_runaway_fraction))
+        self.var_verdict.set(cfg.side_verdict_mode)
         self.var_useover.set(cfg.use_manual_overrides)
         self.var_minsides.set(str(cfg.min_good_sides))
         self.var_rejmode.set(cfg.rejected_mode)
@@ -329,8 +351,9 @@ class BeamProfilerApp(tk.Tk):
     # Three things live here beyond "look at the PNGs":
     #   * a POSITION FILTER, so the 40-odd side images of a 13-point run can be
     #     narrowed to the one probe position you are questioning;
-    #   * the PROFILE PICKER, a live plot of the profile where clicking a point
-    #     takes you straight to the side fits that produced it;
+    #   * the CLICKABLE PROFILE: in the 03_profile stage a profile_*.png is drawn
+    #     as a live plot (fit curve and all), and clicking a point jumps to the
+    #     side fits that produced it;
     #   * the VERDICT BAR, which forces a side to accept/reject when the
     #     automatic tests got it wrong (written to manual_overrides.json and
     #     applied on the next run — see beamprofiler/side_overrides.py).
@@ -357,7 +380,6 @@ class BeamProfilerApp(tk.Tk):
         self.listbox = tk.Listbox(body, width=40, font=("Consolas", 9), exportselection=False)
         self.listbox.pack(side="left", fill="y")
         self.listbox.bind("<<ListboxSelect>>", lambda e: self._show_selected())
-        self.listbox.bind("<Double-Button-1>", lambda e: self._on_list_double_click())
 
         self.display = ttk.Frame(body)
         self.display.pack(side="left", fill="both", expand=True)
@@ -370,16 +392,19 @@ class BeamProfilerApp(tk.Tk):
 
         self._current_photo = None
         self._stage_files: list[Path] = []
-        self._picker_widget = None          # FigureCanvasTkAgg widget, built lazily
-        self._picker_canvas = None
-        self._picker_fig = None
-        self._picker_ax = None
-        self._picker_marker = None
-        self._picker_shown = False
-        self._picker_points = None          # (positions, amplitudes) in data coords
+        # The clickable-profile canvas (built lazily; a bare Figure, not pyplot).
+        self._prof_widget = None
+        self._prof_canvas = None
+        self._prof_fig = None
+        self._prof_ax = None
+        self._prof_shown = False
+        self._prof_points = None            # list of (dy_mm_or_pos, amplitude, position)
+        self._prof_last_pos = None          # position last jumped-from, ringed on return
         self._profile_rows: list[dict] = []  # absorption_profile.csv
         self._side_rows: dict[str, dict] = {}   # image filename -> side_details.csv row
         self._point_stems: dict[float, list[str]] = {}   # position -> file stems
+        self._results: dict = {}            # results.json (fit params for the curve)
+        self._upm: float = 39.3701          # position_units_per_mm from config_used.json
         self._overrides: dict[str, str] = {}
 
     def _build_verdict_bar(self, parent):
@@ -424,8 +449,6 @@ class BeamProfilerApp(tk.Tk):
                     stages.append(str(sub.relative_to(root)))
             if any(root.glob("*.png")):
                 stages.insert(0, FINAL_STAGE)
-            if self._profile_rows:
-                stages.insert(0, PICKER_STAGE)
         self.combo_stage["values"] = stages
         positions = [ALL_POSITIONS] + [f"{r['position']:g} thou" for r in self._profile_rows]
         self.combo_pos["values"] = positions
@@ -437,12 +460,25 @@ class BeamProfilerApp(tk.Tk):
         self._update_override_count()
 
     def _read_run_tables(self, root: Path):
-        """Read the two CSVs the browser needs: the profile and the side details.
+        """Read what the browser needs: the profile CSV, the side details, the
+        fit parameters (results.json) and the mm-per-unit scale (config_used.json).
 
-        Read with the csv module rather than pandas — they are small, and the GUI
-        should still open if the analysis dependencies are half-installed.
+        Read with the csv/json modules rather than pandas — they are small, and
+        the GUI should still open if the analysis dependencies are half-installed.
         """
         self._profile_rows, self._side_rows, self._point_stems = [], {}, {}
+        self._results = {}
+        try:
+            rj = root / "results.json"
+            if rj.exists():
+                self._results = json.loads(rj.read_text(encoding="utf-8"))
+            cfg = root / "config_used.json"
+            if cfg.exists():
+                self._upm = float(json.loads(cfg.read_text(encoding="utf-8"))
+                                  .get("position_units_per_mm", self._upm))
+        except (json.JSONDecodeError, OSError, ValueError):
+            pass
+
         prof = root / "03_profile" / "absorption_profile.csv"
         if prof.exists():
             with open(prof, newline="", encoding="utf-8") as fh:
@@ -453,6 +489,8 @@ class BeamProfilerApp(tk.Tk):
                             "amplitude": float(row["amplitude"]),
                             "amplitude_err": float(row["amplitude_err"]),
                             "flagged": str(row.get("flagged", "")).lower() == "true",
+                            "suspect": str(row.get("suspect", "")).lower() == "true",
+                            "included": str(row.get("included", "true")).lower() == "true",
                             "n_good_sides": int(float(row.get("n_good_sides", 0))),
                             "n_sides": int(float(row.get("n_sides", 0))),
                             "n_overridden": int(float(row.get("n_overridden", 0) or 0)),
@@ -493,16 +531,6 @@ class BeamProfilerApp(tk.Tk):
         stage = self.var_stage.get()
         self.listbox.delete(0, "end")
 
-        if stage == PICKER_STAGE:
-            self._stage_files = []
-            for r in self._profile_rows:
-                mark = "!" if r["flagged"] else " "
-                self.listbox.insert(
-                    "end", f"{mark}{r['position']:>7g} thou  A={r['amplitude']:.4f}%  "
-                           f"{r['n_good_sides']}/{r['n_sides']}")
-            self._show_picker()
-            return
-
         folder = out if stage == FINAL_STAGE else out / stage
         files = sorted(folder.glob("*.png"))
         pos = self._filter_position()
@@ -514,8 +542,18 @@ class BeamProfilerApp(tk.Tk):
         for p in files:
             self.listbox.insert("end", self._list_label(p))
         if files:
+            # In 03_profile default to the first profile_*.png, so the clickable
+            # profile shows straight away (the folder also holds the transmission
+            # and sawtooth-amplitude diagnostics, which stay plain images).
+            default = 0
+            if stage == PROFILE_STAGE:
+                for i, p in enumerate(files):
+                    if p.name.startswith("profile_"):
+                        default = i
+                        break
             self.listbox.selection_clear(0, "end")
-            self.listbox.selection_set(0)
+            self.listbox.selection_set(default)
+            self.listbox.see(default)
         self._show_selected()
 
     def _list_label(self, path: Path) -> str:
@@ -525,6 +563,8 @@ class BeamProfilerApp(tk.Tk):
             return path.name
         if self._overrides.get(row.get("side", "")):
             mark = "M"          # verdict set by hand, not yet re-run
+        elif str(row.get("suspect", "")).lower() == "true":
+            mark = "?"          # accepted but auto-tests failed (flag mode) — review
         elif str(row.get("accepted", "")).lower() == "true":
             mark = "+"
         else:
@@ -542,21 +582,24 @@ class BeamProfilerApp(tk.Tk):
         self.listbox.see(i)
         self._show_selected()
 
-    def _on_list_double_click(self):
-        """In the picker, double-clicking a position jumps to its side fits."""
-        if self.var_stage.get() != PICKER_STAGE:
-            return
+    def _selected_profile_model(self) -> str | None:
+        """The model name if the selection is a profile_<model>.png in 03_profile."""
+        if self.var_stage.get() != PROFILE_STAGE:
+            return None
         sel = self.listbox.curselection()
-        if sel and sel[0] < len(self._profile_rows):
-            self._goto_position_sides(self._profile_rows[sel[0]]["position"])
+        if not sel or sel[0] >= len(self._stage_files):
+            return None
+        m = re.match(r"profile_(.+)\.png$", self._stage_files[sel[0]].name)
+        return m.group(1) if m else None
 
-    # ── display: either a saved PNG or the interactive picker ─────────────────
+    # ── display: a saved PNG, or the clickable profile for a profile_*.png ─────
     def _show_selected(self, redraw_only: bool = False):
-        if self.var_stage.get() == PICKER_STAGE:
-            self._highlight_picker_selection()
+        model = self._selected_profile_model()
+        if model is not None:
+            self._show_profile(model)
             self._update_verdict_bar(None)
             return
-        self._show_picker(hide=True)
+        self._show_profile(hide=True)
         sel = self.listbox.curselection()
         if not self._stage_files or not sel:
             self._update_verdict_bar(None)
@@ -577,104 +620,127 @@ class BeamProfilerApp(tk.Tk):
         self._current_photo = ImageTk.PhotoImage(img)
         self.img_label.configure(image=self._current_photo, text="")
 
-    def _show_picker(self, hide: bool = False):
-        """Draw (or hide) the clickable profile.
+    def _show_profile(self, model: str | None = None, hide: bool = False):
+        """Draw (or hide) the clickable version of a profile_<model>.png.
 
         Built with a bare Figure + FigureCanvasTkAgg rather than pyplot: the
         pipeline's own figures are made on a worker thread through the Agg
-        backend, and the two must not share pyplot's figure manager.
+        backend, and the two must not share pyplot's figure manager. The static
+        profile_<model>.png still exists on disk for reports; this is the same
+        plot made interactive.
         """
         if hide:
-            if self._picker_shown:
-                if self._picker_widget is not None:
-                    self._picker_widget.pack_forget()
+            if self._prof_shown:
+                if self._prof_widget is not None:
+                    self._prof_widget.pack_forget()
                 self.img_label.pack(fill="both", expand=True)
-                self._picker_shown = False
+                self._prof_shown = False
             return
 
-        if not self._picker_shown:
+        if not self._prof_shown:
             try:
                 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
                 from matplotlib.figure import Figure
             except ImportError:
                 self.img_label.configure(
-                    image="", text="matplotlib is needed for the profile picker.")
+                    image="", text="matplotlib is needed for the interactive profile.")
                 return
-            if self._picker_widget is None:
-                self._picker_fig = Figure(figsize=(6.5, 4.6), dpi=100)
-                self._picker_canvas = FigureCanvasTkAgg(self._picker_fig, master=self.display)
-                self._picker_canvas.mpl_connect("button_press_event", self._on_picker_click)
-                self._picker_widget = self._picker_canvas.get_tk_widget()
+            if self._prof_widget is None:
+                self._prof_fig = Figure(figsize=(7.2, 4.8), dpi=100)
+                self._prof_canvas = FigureCanvasTkAgg(self._prof_fig, master=self.display)
+                self._prof_canvas.mpl_connect("button_press_event", self._on_profile_click)
+                self._prof_widget = self._prof_canvas.get_tk_widget()
             self.img_label.pack_forget()
-            self._picker_widget.pack(fill="both", expand=True)
-            self._picker_shown = True
-        self._draw_picker()
+            self._prof_widget.pack(fill="both", expand=True)
+            self._prof_shown = True
+        self._draw_profile(model)
 
-    def _draw_picker(self):
-        fig = self._picker_fig
+    def _draw_profile(self, model: str):
+        import numpy as np
+        fig = self._prof_fig
         fig.clear()
         ax = fig.add_subplot(111)
         rows = self._profile_rows
         if not rows:
             ax.text(0.5, 0.5, "No absorption_profile.csv yet — run the pipeline.",
                     ha="center", va="center", transform=ax.transAxes, color="gray")
-            self._picker_canvas.draw_idle()
+            self._prof_canvas.draw_idle()
             return
 
-        x = [r["position"] for r in rows]
-        y = [r["amplitude"] for r in rows]
-        e = [r["amplitude_err"] for r in rows]
-        colors = ["#d7301f" if r["flagged"] else "#2c7fb8" for r in rows]
-        ax.errorbar(x, y, yerr=e, fmt="none", ecolor="#9ecae1", capsize=3, zorder=1)
-        ax.scatter(x, y, c=colors, s=45, zorder=3)
-        # Ring the positions that already carry a hand-set verdict.
-        marked = [(r["position"], r["amplitude"]) for r in rows if r["n_overridden"]]
+        info = (self._results.get("zone1") or {}).get(model) or {}
+        params = info.get("params")
+        centered = params is not None and "x0" in params
+        x0 = float(params["x0"]) if centered else 0.0
+        upm = self._upm
+
+        def xco(pos):
+            return (pos - x0) / upm if centered else pos
+
+        # One clickable point per position, remembered for the pixel hit-test.
+        self._prof_points = [(xco(r["position"]), r["amplitude"], r["position"]) for r in rows]
+        ax.errorbar([p[0] for p in self._prof_points], [r["amplitude"] for r in rows],
+                    yerr=[r["amplitude_err"] for r in rows], fmt="none", ecolor="#9ecae1",
+                    capsize=3, zorder=1)
+
+        def scat(pred, **kw):
+            xs = [xco(r["position"]) for r in rows if pred(r)]
+            ys = [r["amplitude"] for r in rows if pred(r)]
+            if xs:
+                ax.scatter(xs, ys, zorder=3, **kw)
+
+        scat(lambda r: not r["flagged"] and not r["suspect"],
+             marker="x", s=48, color="#2c7fb8", label="data")
+        scat(lambda r: r["suspect"], marker="D", s=42, color="#b8860b", label="suspect (review)")
+        scat(lambda r: r["flagged"], marker="o", s=40, color="#d7301f", label="noise-dominated")
+
+        marked = [r for r in rows if r["n_overridden"]]
         if marked:
-            ax.scatter([p for p, _ in marked], [a for _, a in marked], s=150,
-                       facecolors="none", edgecolors="#762a83", linewidths=1.8, zorder=2,
-                       label="has manual verdict")
-            ax.legend(fontsize=8, loc="best")
-        self._picker_marker = ax.scatter([], [], s=220, facecolors="none",
-                                         edgecolors="#31a354", linewidths=2.2, zorder=4)
-        ax.set_xlabel("Stage position [thou]")
+            ax.scatter([xco(r["position"]) for r in marked], [r["amplitude"] for r in marked],
+                       s=175, facecolors="none", edgecolors="#762a83", linewidths=1.8,
+                       zorder=2, label="has manual verdict")
+        if self._prof_last_pos is not None:
+            here = [r for r in rows if r["position"] == self._prof_last_pos]
+            if here:
+                ax.scatter([xco(here[0]["position"])], [here[0]["amplitude"]], s=250,
+                           facecolors="none", edgecolors="#31a354", linewidths=2.0, zorder=4)
+
+        if params is not None:
+            xs = np.array([r["position"] for r in rows], dtype=float)
+            pad = 0.05 * (np.ptp(xs) or 1.0)
+            xf = np.linspace(xs.min() - pad, xs.max() + pad, 600)
+            ax.plot((xf - x0) / upm if centered else xf, _reconstruct_curve(model, params, xf),
+                    color="#2c7fb8", lw=1.8, alpha=0.9, label=f"{model.replace('_', '-')} fit")
+
+        sub = ""
+        if info.get("r_squared") is not None:
+            sub = f"  (R²={info['r_squared']:.3f}, FWHM={info.get('fwhm_mm', float('nan')):.2f} mm)"
+        ax.set_xlabel(r"$\Delta y$ [mm]" if centered else "Stage position [thou]")
         ax.set_ylabel("Absorption [%]")
-        ax.set_title("Click a point to open its side fits  (red = noise-dominated)",
+        ax.set_title(f"Click a point to open its side fits — {model.replace('_', '-')}{sub}",
                      fontsize=9, color="gray")
         ax.grid(ls="--", alpha=0.4)
+        ax.legend(fontsize=8, loc="best")
+        self._prof_ax = ax
         fig.tight_layout()
-        self._picker_points = (x, y)
-        self._picker_ax = ax
-        self._highlight_picker_selection()
+        self._prof_canvas.draw_idle()
 
-    def _highlight_picker_selection(self):
-        """Ring the position highlighted in the list, so list and plot agree."""
-        if self._picker_widget is None or self._picker_points is None:
-            return
-        sel = self.listbox.curselection()
-        x, y = self._picker_points
-        if sel and sel[0] < len(x):
-            self._picker_marker.set_offsets([[x[sel[0]], y[sel[0]]]])
-        else:
-            self._picker_marker.set_offsets(_empty_offsets())
-        self._picker_canvas.draw_idle()
-
-    def _on_picker_click(self, event):
+    def _on_profile_click(self, event):
         """Nearest-point pick, in pixels so both axes count equally."""
-        if event.inaxes is None or not self._picker_points:
+        if event.inaxes is None or not self._prof_points:
             return
-        x, y = self._picker_points
         best_i, best_d = None, 1e9
-        for i, (xi, yi) in enumerate(zip(x, y)):
-            px, py = self._picker_ax.transData.transform((xi, yi))
-            d = ((px - event.x) ** 2 + (py - event.y) ** 2) ** 0.5
+        for i, (px, py, _pos) in enumerate(self._prof_points):
+            sx, sy = self._prof_ax.transData.transform((px, py))
+            d = ((sx - event.x) ** 2 + (sy - event.y) ** 2) ** 0.5
             if d < best_d:
                 best_i, best_d = i, d
-        if best_i is None or best_d > 40:      # 40 px — a miss, not a pick
+        if best_i is None or best_d > 45:       # 45 px — a miss, not a pick
             return
-        self._goto_position_sides(self._profile_rows[best_i]["position"])
+        self._goto_position_sides(self._prof_points[best_i][2])
 
     def _goto_position_sides(self, position: float):
         """Filter to one probe position and show its 02_side_fits images."""
+        self._prof_last_pos = position          # ringed green when you come back
         self.var_posfilter.set(f"{position:g} thou")
         stages = list(self.combo_stage["values"])
         if "02_side_fits" in stages:
@@ -699,6 +765,7 @@ class BeamProfilerApp(tk.Tk):
             return
         row = self._side_rows.get(path.name, {})
         auto = str(row.get("auto_accepted", row.get("accepted", ""))).lower() == "true"
+        suspect = str(row.get("suspect", "")).lower() == "true"
         current = self._overrides.get(stem)
         # What the automatic tests said, then what will actually be used. The
         # two are shown separately on purpose: an override should never make it
@@ -711,6 +778,8 @@ class BeamProfilerApp(tk.Tk):
         reasons = row.get("reject_reasons", "")
         if reasons:
             line += f"\n   {reasons}"
+        if suspect:
+            line += "\n   SUSPECT: kept as accepted (flag mode) — review, and Force REJECT if bad"
         line += ("\n   -> manual verdict: NONE (automatic)" if current is None
                  else f"\n   -> manual verdict: {current.upper()} (applied on the next run)")
         self.lbl_verdict.configure(text=line)

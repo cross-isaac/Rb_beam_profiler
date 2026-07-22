@@ -53,6 +53,7 @@ class PositionResult:
     n_good_sides: int = 0
     n_sides: int = 0
     n_overridden: int = 0                 # sides whose verdict was set by hand
+    n_suspect_sides: int = 0              # accepted-but-flagged sides (flag mode)
     flagged: bool = False                 # fewer than min_good_sides passed (drawn red)
     include_in_profile: bool = True
     dc_mean: float | None = None
@@ -121,6 +122,7 @@ def _combine_sides(sides: list[SideResult], config: AnalysisConfig) -> PositionR
     good = [s for s in sides if s.peak.accepted]
     pr.n_good_sides = len(good)
     pr.n_overridden = sum(1 for s in sides if s.peak.manual_override is not None)
+    pr.n_suspect_sides = sum(1 for s in sides if s.peak.suspect)
     noise = [s.sigma for s in sides if np.isfinite(s.sigma)]
     pr.noise_floor = float(np.median(noise)) if noise else 0.0
 
@@ -284,6 +286,7 @@ def run_extraction(data_folder: str, output_folder: str, config: AnalysisConfig,
                 "snr": sr.peak.snr, "delta_aic": sr.peak.delta_aic,
                 "accepted": sr.peak.accepted,
                 "auto_accepted": sr.peak.auto_accepted,
+                "suspect": sr.peak.suspect,
                 "manual_override": sr.peak.manual_override or "",
                 "reject_reasons": "; ".join(sr.peak.reject_reasons),
                 "bg_fallback": sr.ramp.used_fallback,
@@ -294,6 +297,8 @@ def run_extraction(data_folder: str, output_folder: str, config: AnalysisConfig,
 
     for pr in results:
         tag = "ok" if not pr.flagged else "FLAGGED (noise)"
+        if pr.n_suspect_sides:
+            tag += f", {pr.n_suspect_sides} suspect"
         if pr.n_overridden:
             tag += f", {pr.n_overridden} manual"
         _log(progress, f"  position {pr.position:g}: {pr.n_good_sides}/{pr.n_sides} sides good"
@@ -302,7 +307,8 @@ def run_extraction(data_folder: str, output_folder: str, config: AnalysisConfig,
     rows = [{
         "position": pr.position, "amplitude": pr.amplitude, "amplitude_err": pr.amplitude_err,
         "n_good_sides": pr.n_good_sides, "n_sides": pr.n_sides, "n_files": pr.n_files,
-        "n_overridden": pr.n_overridden,
+        "n_overridden": pr.n_overridden, "n_suspect_sides": pr.n_suspect_sides,
+        "suspect": pr.n_suspect_sides > 0,
         "flagged": pr.flagged, "included": pr.include_in_profile,
         "noise_floor": pr.noise_floor, "dc_mean_V": pr.dc_mean,
         "ramp_span_V": pr.ramp_span_V, "ramp_span_err_V": pr.ramp_span_err_V,
@@ -343,10 +349,13 @@ def run_profile(df: pd.DataFrame, output_folder: str, config: AnalysisConfig,
     e = df["amplitude_err"].to_numpy(dtype=float)
     included = df["included"].to_numpy(dtype=bool)
     accepted = ~df["flagged"].to_numpy(dtype=bool)
+    suspect = (df["suspect"].to_numpy(dtype=bool) if "suspect" in df.columns
+               else np.zeros(len(x), dtype=bool))
 
     fits: dict[str, ProfileFit] = {}
     for model in config.profile_models:
-        pf = fit_profile(x, y, e, model, config, included=included, accepted=accepted)
+        pf = fit_profile(x, y, e, model, config, included=included,
+                         accepted=accepted, suspect=suspect)
         fits[model] = pf
         plotting.plot_profile(pf, config, str(dir_prof / f"profile_{model}.png"),
                               dataset_label=f"{label} — {model} profile fit",

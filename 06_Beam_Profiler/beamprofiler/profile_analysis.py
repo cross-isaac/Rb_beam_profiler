@@ -74,6 +74,7 @@ class ProfileFit:
     y_err: np.ndarray = field(default=None)
     included: np.ndarray = field(default=None)   # bool mask of points used in the fit
     accepted: np.ndarray = field(default=None)   # bool mask of noise-validated points (styling)
+    suspect: np.ndarray = field(default=None)    # accepted-but-flagged points, flag mode (styling)
 
     @property
     def center(self) -> float:
@@ -93,12 +94,19 @@ def _initial_profile_guess(x, y):
     return A0, x0, max(fwhm0, float(np.min(np.diff(np.sort(x)))))
 
 
-def fit_profile(x, y, y_err, model, config, included=None, accepted=None) -> ProfileFit:
-    """Fit one model to the spatial profile A(Δy)."""
+def fit_profile(x, y, y_err, model, config, included=None, accepted=None,
+                suspect=None) -> ProfileFit:
+    """Fit one model to the spatial profile A(Δy).
+
+    `suspect` only styles the plot (amber "review me" points); suspect points are
+    still accepted, so they are part of the fit like any other accepted point.
+    """
     if included is None:
         included = np.ones(len(x), dtype=bool)
     if accepted is None:
         accepted = included.copy()
+    if suspect is None:
+        suspect = np.zeros(len(x), dtype=bool)
     xf, yf, ef = x[included], y[included], y_err[included]
     ef = np.where(ef > 0, ef, np.max(ef) if np.max(ef) > 0 else 1.0)
 
@@ -146,7 +154,7 @@ def fit_profile(x, y, y_err, model, config, included=None, accepted=None) -> Pro
         fwhm_mm=fwhm_mm, fwhm_mm_err=fwhm_mm_err,
         theta_half_deg=theta, theta_half_deg_err=theta_err,
         capture_eff=P, capture_eff_err=P_err, eta=eta,
-        x=x, y=y, y_err=y_err, included=included, accepted=accepted,
+        x=x, y=y, y_err=y_err, included=included, accepted=accepted, suspect=suspect,
     )
 
 

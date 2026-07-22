@@ -36,6 +36,10 @@ def main() -> int:
     ap.add_argument("--gamma-max", type=float, metavar="R",
                     help="upper linewidth bound as a multiple of the reference HWHM "
                          "(default 2.5) — sets where 'ran away' starts")
+    ap.add_argument("--verdict-mode", choices=["auto", "flag"],
+                    help="'auto' (default) rejects failing sides; 'flag' accepts every "
+                         "side and marks the failing ones suspect for manual review "
+                         "(changes the profile — noise edges enter until you reject them)")
     ap.add_argument("--no-overrides", action="store_true",
                     help="ignore manual_overrides.json in the output folder "
                          "(reproduce a purely automatic analysis)")
@@ -66,6 +70,8 @@ def main() -> int:
         config.linewidth_runaway_fraction = args.runaway_fraction
     if args.gamma_max is not None:
         config.gamma_rel_bounds = (config.gamma_rel_bounds[0], args.gamma_max)
+    if args.verdict_mode is not None:
+        config.side_verdict_mode = args.verdict_mode
     if args.no_overrides:
         config.use_manual_overrides = False
     if args.rejected_mode is not None:

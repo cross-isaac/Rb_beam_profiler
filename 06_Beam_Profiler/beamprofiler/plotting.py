@@ -31,6 +31,7 @@ FIT_COLOR = "#2c7fb8"      # blue  — fits
 MASK_COLOR = "#66c2a5"     # green — background anchors
 BAD_COLOR = "#d7301f"      # red   — rejected
 OVERRIDE_COLOR = "#762a83" # purple — verdict set by hand, not by the tests
+SUSPECT_COLOR = "#b8860b"  # dark goldenrod — accepted but auto-tests failed (flag mode; review)
 
 
 def _save(fig, path: str) -> str:
@@ -106,7 +107,10 @@ def plot_side_fit(side, side_result, path: str, title: str = "",
     # ── bottom: subtracted + fit ─────────────────────────────────────────────
     ax2.plot(t_ms, side_result.y, ".", ms=1.5, color=DATA_COLOR, label="data − background")
     if peak.popt is not None:
-        color = FIT_COLOR if peak.accepted else BAD_COLOR
+        if peak.suspect:
+            color = SUSPECT_COLOR       # accepted, but the tests are unhappy — review
+        else:
+            color = FIT_COLOR if peak.accepted else BAD_COLOR
         ax2.plot(t_ms, peak.curve(side.t), color=color, lw=1.8, label="Lorentzian fit")
         verdict = peak.verdict_label
         if peak.reject_reasons:
@@ -121,10 +125,15 @@ def plot_side_fit(side, side_result, path: str, title: str = "",
         info = textwrap.fill("FIT FAILED: " + "; ".join(peak.reject_reasons), width=95)
     # The verdict goes UNDER the axes, not inside them: reject reasons can run
     # long, and a box floating over the data hid whichever part of the trace
-    # explains the verdict. A hand-set verdict gets a heavier, differently
-    # coloured box so it is obvious at a glance which images are not automatic.
-    edge = OVERRIDE_COLOR if peak.manual_override is not None else color
-    lw = 2.2 if peak.manual_override is not None else 1.0
+    # explains the verdict. A hand-set verdict (purple) or a suspect flag
+    # (goldenrod) gets a heavier, differently coloured box so it is obvious at a
+    # glance which images still need a human decision.
+    if peak.manual_override is not None:
+        edge, lw = OVERRIDE_COLOR, 2.2
+    elif peak.suspect:
+        edge, lw = SUSPECT_COLOR, 2.0
+    else:
+        edge, lw = color, 1.0
     ax2.set_xlabel("Laser scan time [ms]", fontsize=10)
     ax2.set_ylabel(y_label, fontsize=10)
     ax2.legend(fontsize=8, loc="upper right")
@@ -213,10 +222,16 @@ def plot_profile(pf, config: AnalysisConfig, path: str, dataset_label: str = "",
     if dataset_label:
         fig.suptitle(dataset_label, fontsize=9, color="gray")
 
-    good = pf.accepted if pf.accepted is not None else pf.included
-    bad = ~good
-    ax.errorbar((pf.x[good] - x0) / upm, rescale * pf.y[good], yerr=rescale * pf.y_err[good],
+    accepted = pf.accepted if pf.accepted is not None else pf.included
+    suspect = pf.suspect if pf.suspect is not None else np.zeros(len(pf.x), dtype=bool)
+    clean = accepted & ~suspect
+    bad = ~accepted
+    ax.errorbar((pf.x[clean] - x0) / upm, rescale * pf.y[clean], yerr=rescale * pf.y_err[clean],
                 fmt="x", ms=5, capsize=2, ls="None", color=FIT_COLOR, label="data")
+    if suspect.any():
+        ax.errorbar((pf.x[suspect] - x0) / upm, rescale * pf.y[suspect],
+                    yerr=rescale * pf.y_err[suspect], fmt="D", ms=5, capsize=2, ls="None",
+                    color=SUSPECT_COLOR, label="suspect (review)")
     if bad.any():
         ax.errorbar((pf.x[bad] - x0) / upm, rescale * pf.y[bad], yerr=rescale * pf.y_err[bad],
                     fmt="o", ms=4, capsize=2, ls="None", color=BAD_COLOR, alpha=0.6,

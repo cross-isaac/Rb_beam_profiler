@@ -81,15 +81,23 @@ python run_gui.py
 2. **Image Browser** — click through every stage image (segmentation, per-side
    background + peak fits with accept/reject verdicts, profile fits, summaries).
    - **Position filter** narrows the per-side images to one probe position.
-   - **(profile picker)** is a live profile: click a point to jump straight to
-     the `02_side_fits` images behind it (red = noise-dominated; a purple ring
-     marks a position that already carries a hand-set verdict).
+   - **Clickable profile:** in the `03_profile` stage the `profile_<model>.png`
+     is drawn as a *live* plot — the same profile with its fit curve — and
+     clicking a point jumps straight to the `02_side_fits` images behind it. Blue
+     = clean, amber diamond = suspect (review), red = noise-dominated; a purple
+     ring marks a position that already carries a hand-set verdict, and a green
+     ring shows the point you last jumped from. The other `03_profile` diagnostics
+     (transmission, sawtooth amplitude) stay as plain images in the same list.
    - **Side verdict bar** forces the selected side to ACCEPT or REJECT when the
      automatic SNR/dAIC/runaway tests got it wrong. Verdicts are saved to
      `manual_overrides.json` and take effect on the next run ("Re-run pipeline"
      is right there); the automatic verdict is always shown alongside so an
      override can never be mistaken for a fit that passed on its own.
 3. **Results** — the final numbers; button to open the output folder.
+
+Side-image / list markers: `+` accepted, `-` rejected, `?` suspect (flag mode —
+accepted but the auto-tests failed; review it), `M` a hand-set verdict pending a
+re-run.
 
 Settings save/load as JSON so a whole analysis is reproducible.
 
@@ -138,8 +146,8 @@ profile is absolute and the flux comes directly from it — no calibration trace
 ├── 02_side_fits/               per side: peak-aware background (top) and
 │                               Lorentzian fit with ACCEPT/REJECT verdict (bottom)
 ├── 03_profile/
-│   ├── absorption_profile.csv    per-position amplitude, error, flags, CH2 level, sawtooth amp
-│   ├── side_details.csv          per-side amplitude, centre, HWHM, SNR, verdicts (auto + manual)
+│   ├── absorption_profile.csv    per-position amplitude, error, flags, suspect, CH2 level, sawtooth amp
+│   ├── side_details.csv          per-side amplitude, centre, HWHM, SNR, verdicts (auto + suspect + manual)
 │   ├── transmission_vs_position.png   CH2 DC level vs position
 │   ├── amplitude_vs_position.png      CH3 sawtooth (laser-sweep) amplitude vs position
 │   └── profile_<model>.png       spatial profile fit + parameter table
@@ -154,6 +162,32 @@ span ÷ the CH2 DC level, i.e. the fractional sweep depth reaching the detector,
 which should be **flat** across the scan if CH3 is simply the AC copy of CH2. A
 slope or step there flags a gain/range change the absolute-absorption scale
 should not be trusted through.
+
+## Verdict mode: reject vs. flag-for-review
+
+`side_verdict_mode` decides what the automatic SNR / dAIC / runaway tests *do* to
+a side that fails them:
+
+- **`auto`** (default) — a failing side is **rejected**. Under the default
+  `rejected_mode: zero` a beam-edge position with no resolvable line is counted
+  as zero absorption, which is the physically conservative, thesis behaviour.
+- **`flag`** — **nothing is rejected automatically.** Every side that produced a
+  fit is *accepted*, and a failing one is marked **suspect** (amber in the
+  browser, `?` in the list, a `suspect` column in the CSVs). You then eyeball the
+  suspects and Force REJECT the genuinely bad ones by hand. Use this to review
+  every point yourself instead of trusting the thresholds.
+
+  ⚠ **This changes the numbers.** Until you reject them, noise-only edge sides
+  enter the profile at their fitted (noise-level) amplitude, which *broadens the
+  fitted beam* — on the TestFitting dataset the Gaussian FWHM goes 6.39 → 8.52 mm
+  and capture efficiency drops accordingly. A `flag` run is therefore **not
+  comparable to an `auto` run** unless you have reviewed and rejected the
+  suspects. In both modes the reference linewidth is still measured only from
+  sides that genuinely pass the tests, so switching modes never moves the
+  matched-filter template.
+
+The default stays `auto` so previously computed results are unchanged; set
+`flag` in the GUI ("Verdict mode"), via `--verdict-mode flag`, or in the config.
 
 ## Manual side verdicts
 
@@ -197,6 +231,7 @@ beamprofiler/
 | `snr_min` | 3.0 | reject a side fit below this amplitude/noise ratio |
 | `delta_aic_min` | 6.0 | peak model must beat background-only by this AIC margin |
 | `linewidth_runaway_fraction` | 0.97 | how close to the linewidth ceiling counts as "ran away" (1.0 = only exactly pinned; 0 = test off) |
+| `side_verdict_mode` | `auto` | `auto` rejects failing sides; `flag` accepts every side and marks failures "suspect" for review (see below) |
 | `use_manual_overrides` | True | honour hand-set verdicts in `manual_overrides.json` |
 | `rejected_mode` | `zero` | failed side: `zero` (0, averaged in), `exclude`, or `keep` |
 | `min_good_sides` | 1 | fewer passing sides → position flagged (drawn red) |

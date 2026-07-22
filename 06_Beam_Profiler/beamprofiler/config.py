@@ -97,6 +97,26 @@ class AnalysisConfig:
     # together: widening the bound also moves the runaway threshold outward.
     linewidth_runaway_fraction: float = 0.97
 
+    # How the automatic verdict (SNR / dAIC / runaway) is USED:
+    #   "auto" — a side that fails any test is REJECTED. Rejected sides then
+    #            follow `rejected_mode` below. This is the original, physically
+    #            conservative behaviour: a beam-edge position with no resolvable
+    #            line is counted as zero absorption, not as signal. It is the
+    #            default so previously computed thesis numbers are unchanged.
+    #   "flag" — nothing is rejected automatically. EVERY side that produced a
+    #            fit is accepted; one that fails a test is kept but marked
+    #            "suspect" (amber in the image browser) for you to inspect and
+    #            reject by hand. Use this to eyeball every point yourself instead
+    #            of trusting the thresholds. CAUTION: until you reject them,
+    #            noise-only edge sides enter the profile at their fitted
+    #            (noise-level) amplitude, which broadens the fitted beam and
+    #            changes the FWHM / capture efficiency / flux — so a "flag" run is
+    #            NOT comparable to an "auto" run unless you have reviewed the
+    #            suspects. (A fit that failed to converge is still rejected here.)
+    # In BOTH modes the reference linewidth is measured only from sides that
+    # genuinely pass the tests, and manual verdicts (side_overrides) always win.
+    side_verdict_mode: str = "auto"
+
     # ── combining sides into one profile point ────────────────────────────────
     # Each probe position has several sides. What to do with a side that FAILS
     # the noise test, when forming the per-position amplitude:

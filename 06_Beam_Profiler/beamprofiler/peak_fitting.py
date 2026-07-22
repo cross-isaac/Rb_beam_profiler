@@ -79,12 +79,26 @@ class PeakFit:
     popt: np.ndarray | None = None
 
     @property
+    def suspect(self) -> bool:
+        """Accepted despite failing the automatic tests, with no hand verdict yet.
+
+        This is the "flag mode" review signal: a point the thresholds dislike
+        that a human has not yet accepted or rejected. It is False in "auto" mode
+        (a failing side is rejected there, not flagged) and False once a manual
+        verdict settles the side either way.
+        """
+        return self.accepted and not self.auto_accepted and self.manual_override is None
+
+    @property
     def verdict_label(self) -> str:
-        """Human-readable verdict, naming a manual override when one is in force."""
-        if self.manual_override is None:
-            return "ACCEPTED" if self.accepted else "REJECTED"
-        was = "would auto-accept" if self.auto_accepted else "would auto-reject"
-        return ("ACCEPTED" if self.accepted else "REJECTED") + f" — MANUAL OVERRIDE ({was})"
+        """Human-readable verdict, naming a manual override or a suspect flag."""
+        base = "ACCEPTED" if self.accepted else "REJECTED"
+        if self.manual_override is not None:
+            was = "would auto-accept" if self.auto_accepted else "would auto-reject"
+            return base + f" — MANUAL OVERRIDE ({was})"
+        if self.suspect:
+            return "ACCEPTED (SUSPECT — auto-tests failed, review by hand)"
+        return base
 
     def curve(self, t: np.ndarray) -> np.ndarray:
         if self.popt is None:
@@ -246,8 +260,12 @@ def _refine_and_validate(
         reasons.append(f"linewidth ran away ({result.gamma_pinned_frac:.2f} of the "
                        f"{g_hi * 1e6:.0f} us bound, limit {frac:.2f})")
     result.reject_reasons = reasons
-    result.accepted = not reasons
-    result.auto_accepted = result.accepted
+    result.auto_accepted = not reasons
+    # "flag" mode keeps every fit that converged and merely marks a failing one
+    # suspect (see PeakFit.suspect); "auto" mode makes the test result the
+    # verdict. Manual overrides are applied later, in the pipeline. A fit that
+    # never converged returns earlier, so it stays rejected even in flag mode.
+    result.accepted = True if config.side_verdict_mode == "flag" else result.auto_accepted
     return result
 
 
@@ -318,8 +336,13 @@ def reference_gamma_from(results: dict[float, list[SideResult]]) -> tuple[float 
     reference inflated by weak, broad edge fits widens the peak-exclude window and
     the linewidth bounds enough to let broad Lorentzians run away elsewhere.
     Also returns the strongest position (highest median accepted-side SNR).
+
+    This uses the AUTOMATIC verdict (`auto_accepted`), never the effective one:
+    in "flag" mode every side is accepted, and a template built from noise-level
+    edge fits would be far too broad. The reference must come only from sides the
+    tests genuinely pass, independent of how the verdict is later used.
     """
-    accepted = [s for sides in results.values() for s in sides if s.peak.accepted]
+    accepted = [s for sides in results.values() for s in sides if s.peak.auto_accepted]
     if not accepted:
         return None, None
     accepted.sort(key=lambda s: s.peak.snr, reverse=True)
@@ -328,7 +351,7 @@ def reference_gamma_from(results: dict[float, list[SideResult]]) -> tuple[float 
 
     best_pos, best_snr = None, -np.inf
     for pos, sides in results.items():
-        acc = [s for s in sides if s.peak.accepted]
+        acc = [s for s in sides if s.peak.auto_accepted]
         if acc:
             med_snr = float(np.median([s.peak.snr for s in acc]))
             if med_snr > best_snr:
