@@ -28,7 +28,7 @@ python run_pipeline.py --write-default-config settings.json   # dump every knob
 ## The bug that shaped 06
 
 v1 locked every side's peak position to a single reference position, ±20% of the
-sweep. But **the laser drifts across a run and Isaac nudges it back by hand
+sweep. But **the laser drifts across a run and is nudged back by hand
 mid-scan**, so the resonance wanders over fractional position 0.23–0.87 with no
 smooth trend. Drifted peaks fell outside the locked window and were fit to the
 wrong place or missed — which zeroed the *centre* of the beam and gave a profile
