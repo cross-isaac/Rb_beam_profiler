@@ -77,7 +77,11 @@ python run_gui.py
 ```
 
 1. **Run Analysis** — pick the data folder (`point_*.csv`) and an output folder,
-   adjust settings if needed, press **Run Full Pipeline**, watch the log.
+   adjust settings if needed, press **Run Full Pipeline**, watch the log. Each
+   new run writes to its own `<output folder>/<dataset label>/` subfolder (a
+   numeric suffix is added if that name already exists), so runs never overwrite
+   each other. A **re-run** from the Image Browser (applying manual verdicts)
+   reuses the current run's folder instead of making a new one.
 2. **Image Browser** — click through every stage image (segmentation, per-side
    background + peak fits with accept/reject verdicts, profile fits, summaries).
    - **Position filter** narrows the per-side images to one probe position.
@@ -138,8 +142,11 @@ profile is absolute and the flux comes directly from it — no calibration trace
 
 ## Output layout
 
+The GUI writes each run into a `<output folder>/<dataset label>/` subfolder (see
+above); the CLI writes straight into `--out`. Either way one run folder holds:
+
 ```
-<output folder>/
+<run folder>/
 ├── config_used.json            exact settings of this run (reproducibility)
 ├── manual_overrides.json       hand-set per-side verdicts, if any (see below)
 ├── 01_raw_traces/              full trace + detected side boundaries, per position

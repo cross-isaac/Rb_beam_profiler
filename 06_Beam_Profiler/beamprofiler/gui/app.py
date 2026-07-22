@@ -42,6 +42,29 @@ ALL_POSITIONS = "all positions"
 PROFILE_STAGE = "03_profile"       # the stage whose profile_*.png images are made clickable
 
 
+def _safe_name(label: str) -> str:
+    """Filesystem-safe folder name from a dataset label."""
+    name = re.sub(r'[<>:"/\\|?*]+', "_", label.strip())
+    name = re.sub(r"\s+", "_", name).strip("._")
+    return name or "run"
+
+
+def _unique_run_dir(base: Path, label: str) -> Path:
+    """A NEW subfolder of `base` named for the dataset label.
+
+    Suffixed (`label_2`, `label_3`, ...) if that name already exists, so a fresh
+    run never overwrites a previous run's results — or the manual_overrides.json
+    a previous run may have accumulated.
+    """
+    safe = _safe_name(label)
+    if not (base / safe).exists():
+        return base / safe
+    i = 2
+    while (base / f"{safe}_{i}").exists():
+        i += 1
+    return base / f"{safe}_{i}"
+
+
 def _reconstruct_curve(model: str, params: dict, x_thou):
     """Rebuild a profile model curve from the params saved in results.json.
 
@@ -87,6 +110,11 @@ class BeamProfilerApp(tk.Tk):
         self.log_queue: queue.Queue[str] = queue.Queue()
         self.worker: threading.Thread | None = None
         self._return_to_browser = False   # a run kicked off from the Image Browser
+        # The results folder the browser/results tabs read from. A NEW run writes
+        # to a fresh <output>/<label> subfolder and stores it here; a re-run (apply
+        # verdicts) reuses it. Empty -> the browser reads the Output-folder box
+        # directly, so an existing results folder can still be opened by hand.
+        self._run_dir = ""
 
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True)
@@ -110,6 +138,9 @@ class BeamProfilerApp(tk.Tk):
         self.var_data = tk.StringVar()
         self.var_out = tk.StringVar()
         self.var_label = tk.StringVar()
+        # Editing the Output-folder box means "browse THIS folder", so forget the
+        # subfolder a previous run created (see _run_dir / _active_dir).
+        self.var_out.trace_add("write", lambda *a: setattr(self, "_run_dir", ""))
 
         def picker_row(row, label, var, tip=""):
             ttk.Label(paths, text=label).grid(row=row, column=0, sticky="w", padx=4, pady=3)
@@ -285,12 +316,21 @@ class BeamProfilerApp(tk.Tk):
             self._apply_config(AnalysisConfig.load(p))
             self._log_line(f"Settings loaded from {p}")
 
-    def _on_run(self):
+    def _active_dir(self) -> str:
+        """The results folder the browser and Results tab read from.
+
+        Once a run has happened it is that run's own subfolder (`_run_dir`);
+        otherwise it is whatever is typed in the Output-folder box, so an
+        existing results folder can still be opened by hand.
+        """
+        return self._run_dir or self.var_out.get().strip()
+
+    def _on_run(self, rerun: bool = False):
         if self.worker and self.worker.is_alive():
             messagebox.showinfo("Busy", "A run is already in progress.")
             return
-        data, out = self.var_data.get().strip(), self.var_out.get().strip()
-        if not data or not out:
+        data, base = self.var_data.get().strip(), self.var_out.get().strip()
+        if not data or not base:
             messagebox.showerror("Missing input", "Select both a data folder and an output folder.")
             return
         try:
@@ -299,6 +339,20 @@ class BeamProfilerApp(tk.Tk):
             messagebox.showerror("Bad setting", f"Could not parse a setting: {exc}")
             return
         label = self.var_label.get().strip() or Path(data).name
+
+        # A NEW run gets its own <output>/<label> subfolder so runs never pile up
+        # on top of each other; a re-run (apply verdicts) writes back into the
+        # folder currently in focus, where its manual_overrides.json already lives.
+        if rerun:
+            out = self._active_dir()
+            self._run_dir = out         # lock it so later edits to the box don't move it
+            self._log_line(f"Re-running in {out}")
+        else:
+            run_dir = _unique_run_dir(Path(base), label)
+            run_dir.mkdir(parents=True, exist_ok=True)
+            self._run_dir = str(run_dir)
+            out = self._run_dir
+            self._log_line(f"New run -> {out}")
 
         self.btn_run.configure(state="disabled")
         self.progress.start(12)
@@ -437,7 +491,7 @@ class BeamProfilerApp(tk.Tk):
 
     # ── loading the browsable state ───────────────────────────────────────────
     def _refresh_browser(self):
-        out = self.var_out.get().strip()
+        out = self._active_dir()
         stages: list[str] = []
         keep_stage, keep_pos = self.var_stage.get(), self.var_posfilter.get()
         if out and Path(out).is_dir():
@@ -527,7 +581,7 @@ class BeamProfilerApp(tk.Tk):
             return None
 
     def _load_stage_images(self):
-        out = Path(self.var_out.get().strip() or ".")
+        out = Path(self._active_dir() or ".")
         stage = self.var_stage.get()
         self.listbox.delete(0, "end")
 
@@ -789,9 +843,9 @@ class BeamProfilerApp(tk.Tk):
         stem = self._selected_side_stem()
         if stem is None:
             return
-        out = self.var_out.get().strip()
+        out = self._active_dir()
         if not out:
-            messagebox.showerror("No output folder", "Set the output folder first.")
+            messagebox.showerror("No output folder", "Run or open a results folder first.")
             return
         if verdict is None:
             self._overrides.pop(stem, None)
@@ -823,7 +877,7 @@ class BeamProfilerApp(tk.Tk):
                 "so this run will ignore them.")
         self._return_to_browser = True
         self.notebook.select(self.tab_run)
-        self._on_run()
+        self._on_run(rerun=True)
 
     # ── Tab 3: Results ─────────────────────────────────────────────────────────
     def _build_results_tab(self):
@@ -836,7 +890,7 @@ class BeamProfilerApp(tk.Tk):
         self.results_text.pack(fill="both", expand=True, padx=8, pady=6)
 
     def _open_output(self):
-        out = self.var_out.get().strip()
+        out = self._active_dir()
         if out and Path(out).is_dir():
             if sys.platform == "win32":
                 subprocess.Popen(["explorer", str(Path(out))])
@@ -844,7 +898,7 @@ class BeamProfilerApp(tk.Tk):
                 subprocess.Popen(["xdg-open", str(Path(out))])
 
     def _refresh_results(self):
-        out = self.var_out.get().strip()
+        out = self._active_dir()
         path = Path(out) / "results.json" if out else None
         text = "No results.json found yet — run the pipeline first."
         if path and path.exists():
