@@ -1,0 +1,27 @@
+# ============================================================
+# Analysis inputs and outputs are kept on disk but NOT tracked.
+# Everything below regenerates from run_pipeline.py or the GUI,
+# or is raw scope data that git gives no benefit for.
+# ============================================================
+
+# Pipeline outputs
+Test/test_output*/
+05_Beam_Profiler/TestFitting/
+05_Beam_Profiler/TestFittingResults/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
