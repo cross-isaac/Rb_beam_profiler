@@ -18,12 +18,12 @@ Data layout — the acquisition runner writes one file per scan step:
   * CH4 — scan-controller sync square wave.
   * Probe position comes from `# target_in` (inches -> thou).
 
-Segmentation: the sync square wave (CH4) gives the sweep PERIOD, but its edges
-are phase-shifted from the real sawtooth turning points. So only the period is
-taken from the sync; the turning-point phase is measured from the signal itself
-by folding the trace at the period and fitting an ideal triangle wave with a
-robust loss (a deep absorption dip acts as a localized outlier and cannot pull
-the corners). Each resulting side is one up- or down-sweep through resonance.
+Segmentation: the ramp sides are set by the CH4 sync alone. The sync is a square
+wave at the sweep frequency, but its edges are NOT the sawtooth turning points —
+there is a fixed quarter-period offset: the laser reaches its extreme half-way
+through each sync level, so the turning points are the MIDPOINTS of the CH4 level
+windows and each ramp side runs midpoint-to-midpoint, straddling a CH4 edge.
+Each resulting side is one up- or down-sweep through resonance.
 """
 
 from __future__ import annotations
@@ -137,133 +137,80 @@ def load_trace(path: str, config: AnalysisConfig) -> Trace:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Segmentation
+# Segmentation — the ramp sides come from the CH4 sync alone
+#
+# The scan controller's sync (CH4) is a square wave at the sweep frequency, but
+# its edges are NOT the sawtooth turning points: there is a fixed quarter-period
+# offset (documented in 05_Beam_Profiler and re-measured on the 2026-07-20 and
+# 2026-07-22 runs). The laser reaches its extreme half-way through each sync
+# level, so the turning points are the MIDPOINTS of the CH4 level windows and
+# each ramp side runs midpoint-to-midpoint, straddling a CH4 edge.
+#
+# Taking the boundaries from CH4 alone matters because the sync is a physical
+# feature of the scan drive: it is identical in every file of a run and entirely
+# unaffected by the absorption. Fitting the sawtooth to the CH3 signal instead
+# fails exactly when the line is strong or broad enough to warp the waveform —
+# on the 2026-07-22 run a CH3 triangle fit scattered the period over
+# 3.92-4.14 ms and the turning points by more than 1 ms between files whose CH4
+# edges were identical to the sample.
 # ──────────────────────────────────────────────────────────────────────────────
-def _half_period_from_sync(t: np.ndarray, sync: np.ndarray) -> float | None:
-    """Half-period of the sweep from the sync square wave (median edge spacing)."""
+def _sync_edges(t: np.ndarray, sync: np.ndarray | None) -> np.ndarray:
+    """Times [s] of the CH4 level transitions, debounced."""
+    if sync is None:
+        return np.array([])
     lo, hi = np.percentile(sync, [5, 95])
     if hi - lo < 0.1:                      # sync channel flat/absent
-        return None
+        return np.array([])
     state = sync > 0.5 * (lo + hi)
-    edges = np.flatnonzero(np.diff(state.astype(int)) != 0)
-    if len(edges) < 2:
-        return None
-    te = t[edges]
-    # Debounce glitchy syncs: keep an edge only if well separated from the last.
+    idx = np.flatnonzero(np.diff(state.astype(int)) != 0)
+    if len(idx) == 0:
+        return np.array([])
+    te = t[idx]
+    # Debounce glitchy syncs: a burst of transitions at (nearly) the same time
+    # would otherwise halve the inferred period. Keep an edge only if it is well
+    # separated from the previously kept one.
     min_sep = 0.2 * float(np.max(np.diff(te))) if len(te) > 1 else 0.0
     kept = [float(te[0])]
     for x in te[1:]:
         if float(x) - kept[-1] >= min_sep:
             kept.append(float(x))
-    te = np.asarray(kept)
-    if len(te) < 2:
-        return None
-    if len(te) >= 3:
-        # Lag-2 spacing = one full period, immune to a non-50% duty cycle.
-        return float(np.median(te[2:] - te[:-2])) / 2.0
-    return float(te[1] - te[0])
+    return np.asarray(kept)
 
 
-def _half_period_auto(t: np.ndarray, v: np.ndarray) -> float:
-    """Half-period from the autocorrelation of the signal (sync-less fallback)."""
-    n = min(len(v), 20000)
-    idx = np.linspace(0, len(v) - 1, n).astype(int)
-    vv = v[idx] - np.mean(v[idx])
-    tt = t[idx]
-    ac = np.correlate(vv, vv, mode="full")[n - 1:]
-    ac /= ac[0]
-    i = 1
-    while i < n - 1 and ac[i] > 0:
-        i += 1
-    if i >= n - 2:
-        return (t[-1] - t[0]) / 4.0
-    j = i + int(np.argmax(ac[i:]))
-    return float(tt[j] - tt[0]) / 2.0
+def _turning_points(t: np.ndarray, sync: np.ndarray) -> tuple[list[float], float]:
+    """Sawtooth turning points [s] and the half-period, from CH4 alone.
 
-
-def _triangle(t, t0, period, phi0, duty, amp, off):
-    """Ideal (possibly asymmetric) triangle wave. phi0 in [0,1): phase of the
-    minimum turning point; duty: rising fraction of the period."""
-    x = np.mod((t - t0) / period - phi0, 1.0)
-    up = x < duty
-    y = np.empty_like(x)
-    y[up] = -0.5 + x[up] / duty
-    y[~up] = 0.5 - (x[~up] - duty) / (1.0 - duty)
-    return amp * y + off
-
-
-def _fit_triangle_full(t, v, period_seed):
-    """Fit a triangle wave to the whole trace with the PERIOD free.
-
-    Fitting period, phase, and duty jointly (rather than folding at a fixed,
-    possibly-slightly-wrong sync period) keeps the turning points aligned across
-    the whole record, so the ramp sides come out even. The tiny absorption dip
-    is a localized outlier under the soft-L1 loss and cannot pull the corners.
-    Returns (period, phi0, duty) with phi0 the phase of a minimum turn point.
+    The turning points are the MIDPOINTS of the complete CH4 level windows — the
+    quarter-period offset from the sync edges. The first and last windows are cut
+    off by the acquisition window, so their midpoints are not real turning points;
+    the periodic grid is extrapolated from the complete ones to cover the whole
+    record instead.
     """
-    from scipy.optimize import least_squares
+    edges = _sync_edges(t, sync)
+    if len(edges) < 2:
+        raise ValueError(
+            "CH4 sync has fewer than two usable edges — cannot segment this "
+            "trace. Check that CH4 was recorded and is not flat.")
+    mids = 0.5 * (edges[:-1] + edges[1:])          # complete windows only
+    half_period = (float(np.median(np.diff(mids))) if len(mids) >= 2
+                   else float(np.median(np.diff(edges))))
+    if not np.isfinite(half_period) or half_period <= 0:
+        raise ValueError("Could not determine the sweep period from CH4.")
 
-    t0 = float(t[0])
-    amp0 = float(np.ptp(v))
-    off0 = float(np.mean(v))
-    phi0_init = float(np.mod((np.argmin(v) / len(v)), 1.0))
-    p0 = [period_seed, phi0_init, 0.5, amp0, off0]
-    lb = [0.7 * period_seed, -1.0, 0.2, 0.3 * amp0, -np.inf]
-    ub = [1.3 * period_seed, 2.0, 0.8, 3.0 * amp0, np.inf]
-    res = least_squares(
-        lambda p: _triangle(t, t0, *p) - v, p0, bounds=(lb, ub),
-        loss="soft_l1", f_scale=max(amp0 * 0.05, 1e-9), max_nfev=4000,
-    )
-    period, phi0, duty = float(res.x[0]), float(res.x[1] % 1.0), float(res.x[2])
-    return period, phi0, duty
-
-
-def _period_seed(t, v, sync) -> float:
-    t_half = _half_period_from_sync(t, sync) if sync is not None else None
-    if t_half is None:
-        t_half = _half_period_auto(t, v)
-    return 2.0 * t_half
-
-
-def _fit_triangle_phase(t, v, period, duty, seed_phi0):
-    """Fit only the phase of a triangle wave with period & duty held fixed.
-
-    Used once the global period/duty are known: for each trace only the trigger
-    phase varies, so this one-parameter fit is very robust.
-    """
-    from scipy.optimize import least_squares
-
-    t0 = float(t[0])
-    amp0 = float(np.ptp(v))
-    off0 = float(np.mean(v))
-
-    def resid(p):
-        phi0, amp, off = p
-        return _triangle(t, t0, period, phi0, duty, amp, off) - v
-
-    res = least_squares(resid, [seed_phi0, amp0, off0], loss="soft_l1",
-                        f_scale=max(amp0 * 0.05, 1e-9), max_nfev=2000)
-    return float(res.x[0] % 1.0)
-
-
-def _bounds_from(t, period, phi0, duty) -> list[float]:
-    """Turn-point boundaries of a triangle wave over the record."""
     span0, span1 = float(t[0]), float(t[-1])
-    inner: list[float] = []
-    for phase in (phi0, (phi0 + duty) % 1.0):
-        b = span0 + phase * period
-        while b <= span0:
-            b += period
-        while b < span1:
-            inner.append(float(b))
-            b += period
-    inner.sort()
-    return [span0] + inner + [span1]
+    first = float(mids[0])
+    k_lo = int(np.floor((span0 - first) / half_period)) - 1
+    k_hi = int(np.ceil((span1 - first) / half_period)) + 1
+    grid = [first + k * half_period for k in range(k_lo, k_hi + 1)]
+    return [x for x in grid if span0 < x < span1], half_period
 
 
-def _build_sides(trace: Trace, bounds, period, duty, config) -> Trace:
-    """Turn boundaries into RampSides (edge-trim, bin-average, drop partial ends)."""
-    d_up, d_down = duty * period, (1.0 - duty) * period
+def _build_sides(trace: Trace, bounds, expected_dur, config) -> Trace:
+    """Turn boundaries into RampSides (edge-trim, bin-average, drop partial ends).
+
+    Every full ramp side lasts one half-period, so the partial ramps at the two
+    ends of the record are the ones shorter than `min_side_fraction` of that.
+    """
     dc_lsb = 0.0
     if trace.dc is not None:
         levels = np.unique(trace.dc)
@@ -273,13 +220,7 @@ def _build_sides(trace: Trace, bounds, period, duty, config) -> Trace:
     sides: list[RampSide] = []
     for t0, t1 in zip(bounds[:-1], bounds[1:]):
         dur = t1 - t0
-        sel_dir = (trace.t >= t0) & (trace.t <= t1)
-        if sel_dir.sum() >= 2:
-            slope = np.polyfit(trace.t[sel_dir], trace.v[sel_dir], 1)[0]
-            expected = d_up if slope > 0 else d_down
-        else:
-            expected = min(d_up, d_down)
-        if dur < config.min_side_fraction * expected:      # truncated end ramp
+        if dur < config.min_side_fraction * expected_dur:   # truncated end ramp
             continue
         trim = config.edge_trim_fraction * dur
         sel = (trace.t >= t0 + trim) & (trace.t <= t1 - trim)
@@ -297,40 +238,24 @@ def _build_sides(trace: Trace, bounds, period, duty, config) -> Trace:
     return trace
 
 
-def segment(trace: Trace, config: AnalysisConfig,
-            period: float | None = None, duty: float | None = None) -> Trace:
-    """Split one trace into RampSides.
-
-    With `period`/`duty` given (the shared sweep geometry of the run), only the
-    trigger phase is fitted per trace — far more robust than a free per-trace
-    fit. Otherwise the period, phase and duty are all fitted from this trace.
-    """
-    seed = _period_seed(trace.t, trace.v, trace.sync)
-    if period is None or duty is None:
-        period, phi0, duty = _fit_triangle_full(trace.t, trace.v, seed)
-    else:
-        _, phi0_seed, _ = _fit_triangle_full(trace.t, trace.v, seed)
-        phi0 = _fit_triangle_phase(trace.t, trace.v, period, duty, phi0_seed)
-    return _build_sides(trace, _bounds_from(trace.t, period, phi0, duty), period, duty, config)
+def segment(trace: Trace, config: AnalysisConfig) -> Trace:
+    """Split one trace into RampSides using its CH4 sync."""
+    turns, half_period = _turning_points(trace.t, trace.sync)
+    bounds = [float(trace.t[0])] + turns + [float(trace.t[-1])]
+    return _build_sides(trace, bounds, half_period, config)
 
 
 def segment_all(traces: list[Trace], config: AnalysisConfig) -> tuple[float, float]:
-    """Segment a whole run consistently.
+    """Segment every trace of a run from its own CH4 sync.
 
-    The sweep period and duty cycle are fixed instrument settings for the run,
-    so they are fitted per trace, reduced to a robust median, and then applied to
-    every trace (phase-only per trace). This prevents the occasional bad
-    per-trace period fit from mis-segmenting a single file. Returns the global
-    (period, duty).
+    The sync is a fixed feature of the scan drive, so this is already consistent
+    across the run — no shared geometry has to be imposed. Returns the median
+    (sweep period, duty) for logging; the duty is 0.5 by construction, since
+    every ramp side is one half-period between consecutive turning points.
     """
-    periods, duties = [], []
+    halves = []
     for tr in traces:
-        seed = _period_seed(tr.t, tr.v, tr.sync)
-        p, _phi0, d = _fit_triangle_full(tr.t, tr.v, seed)
-        periods.append(p)
-        duties.append(d)
-    period = float(np.median(periods))
-    duty = float(np.median(duties))
-    for tr in traces:
-        segment(tr, config, period=period, duty=duty)
-    return period, duty
+        segment(tr, config)
+        _turns, half_period = _turning_points(tr.t, tr.sync)
+        halves.append(half_period)
+    return 2.0 * float(np.median(halves)), 0.5

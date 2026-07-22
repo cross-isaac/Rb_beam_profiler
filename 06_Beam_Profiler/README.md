@@ -8,8 +8,8 @@ optional dopant density — with every intermediate step saved as an image.
 
 ```
 run-format scope CSVs (one point_NNNN.csv per probe position)
-   │  1. segment every trace into ramp sides — one whole-run triangle-wave fit
-   │     fixes the sweep period/duty; each trace contributes only its phase
+   │  1. segment every trace into ramp sides straight from the CH4 sync
+   │     (turning points = midpoints of the CH4 level windows)
    │  2. per side: peak-aware corners background (line through the baseline
    │     nearest each end, excluding the located peak)
    │  3. per side: locate the absorption dip with a matched filter (whole-side
@@ -52,10 +52,16 @@ This version:
    0 absorption and is averaged in with the passing sides (`rejected_mode:
    zero`), so a genuine beam-edge position enters the profile honestly. `exclude`
    and `keep` remain available.
-5. **Consistent segmentation.** The sweep period and duty are fixed instrument
-   settings, so they are fitted per trace, reduced to a run-wide median, and
-   applied to every trace (phase-only per trace). One bad per-trace fit can no
-   longer mis-segment a file.
+5. **Segmentation from the CH4 sync alone.** The sync is a physical feature of
+   the scan drive — identical in every file of a run and unaffected by the
+   absorption. Its edges are not the sawtooth turning points (there is a fixed
+   quarter-period offset); the turning points are the **midpoints of the CH4
+   level windows**, measured at fractional position 0.512 ± 0.006 on the
+   2026-07-20 run and 0.510 ± 0.006 on the 2026-07-22 run. Fitting the sawtooth
+   to CH3 instead fails exactly when the line is strong enough to warp the
+   waveform: on the 2026-07-22 run a CH3 triangle fit scattered the period over
+   3.92–4.14 ms and the turning points by more than 1 ms, between files whose
+   CH4 edges were identical to the sample.
 
 On the test dataset the rebuild recovers every previously-lost side (the beam
 centre now sits at the profile peak) and lifts the Gaussian profile R² from 0.37
@@ -217,7 +223,7 @@ reproduce a purely automatic analysis without deleting the file.
 ```
 beamprofiler/
 ├── config.py            AnalysisConfig — every knob, JSON save/load
-├── trace_io.py          run-format CSV loading, whole-run triangle segmentation
+├── trace_io.py          run-format CSV loading, CH4-driven ramp segmentation
 ├── ramp_removal.py      peak-aware corners background
 ├── peak_fitting.py      matched-filter localization, Lorentzian fit, validation
 ├── side_overrides.py    hand-set per-side accept/reject verdicts (manual_overrides.json)

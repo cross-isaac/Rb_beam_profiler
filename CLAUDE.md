@@ -48,9 +48,15 @@ If you touch peak finding: never reintroduce a position prior between sides.
 - A broad Lorentzian with a free offset **can run away and absorb the apex
   curvature**. Guarded by tying fitted HWHM to a robust reference scale and
   rejecting fits pinned at the broad bound.
-- Sweep period and duty are fixed instrument settings for a run, so they are
-  fitted per trace, reduced to a run-wide median, and applied globally with
-  phase-only per trace. One bad per-trace fit would otherwise mis-segment a file.
+- **The sawtooth is set by the CH4 sync — never fit it to CH3.** CH4 is a
+  physical feature of the scan drive: identical in every file of a run and
+  unaffected by the absorption. Its edges are *not* the turning points (fixed
+  quarter-period offset); the turning points are the **midpoints of the CH4
+  level windows** (measured frac 0.512±0.006 and 0.510±0.006 on the 2026-07-20
+  and 2026-07-22 runs). Fitting a triangle to CH3 instead breaks exactly when
+  the line is strong enough to warp the waveform — on 2026-07-22 it scattered
+  the period over 3.92–4.14 ms and the turning points by >1 ms, on files whose
+  CH4 edges were identical to the sample.
 - The up/down-ramp amplitude asymmetry seen in v1 was a **fitting artifact, not
   physical**.
 
