@@ -1,0 +1,6 @@
+# analysis outputs (regenerate with run_pipeline.py / the GUI)
+results/
+
+# python
+__pycache__/
+*.pyc
