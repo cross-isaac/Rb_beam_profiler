@@ -50,6 +50,12 @@ class FluxResult:
 def flux_from_absolute_profile(profile: ProfileFit, config: AnalysisConfig) -> FluxResult:
     """Absolute Rb flux straight from a profile fitted in percent absorption."""
     func = _MODELS[profile.model][0]
+    # SHAPE PARAMETERS ONLY. If the profile was fitted with a constant pedestal
+    # (config.profile_offset), it is deliberately excluded here: a pedestal is a
+    # baseline that does not fall off in the wings, so integrating it over the
+    # transverse coordinate diverges, and it is not beam. Flux and capture
+    # efficiency therefore both describe the peak ABOVE the pedestal, while the
+    # plotted curve includes it.
     args = tuple(profile.popt[:4]) if profile.model == "pseudo_voigt" else tuple(profile.popt[:3])
     thou_to_cm = IN_TO_CM / THOU_PER_IN
     scale = 1.0 / (config.sigma_eff_cm2 * config.f_F3 * config.p_Rb85)

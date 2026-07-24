@@ -80,9 +80,21 @@ class ProfileFit:
     def center(self) -> float:
         return float(self.popt[1])
 
+    @property
+    def offset(self) -> float:
+        """Fitted constant pedestal, or 0.0 when profile_offset was off."""
+        f, names = _MODELS[self.model]
+        return float(self.popt[len(names)]) if len(self.popt) > len(names) else 0.0
+
     def curve(self, x: np.ndarray) -> np.ndarray:
-        f, _ = _MODELS[self.model]
-        return f(x, *self.popt)
+        """Model at x, including the pedestal when one was fitted.
+
+        With config.profile_offset on, fit_profile carries the offset as a
+        TRAILING element of popt that the bare model functions do not accept, so
+        the shape parameters are sliced off and the pedestal added back here.
+        """
+        f, names = _MODELS[self.model]
+        return f(x, *self.popt[:len(names)]) + self.offset
 
 
 # ──────────────────────────────────────────────────────────────────────────────
